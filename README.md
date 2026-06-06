@@ -32,7 +32,7 @@
 گرفتن تنظیمات، و ساخت سرویس `rubika-master`):
 
 ```bash
-git clone https://github.com/Jack6566/V_2rubby
+git clone https://github.com/Shantae86525/Rubika_Runway
 cd V_2rubby
 git checkout feature/worker-admin-system
 chmod +x setup.sh
@@ -55,7 +55,7 @@ systemctl stop rubika-master        # توقف
 
 ```bash
 # ۱) گرفتن سورس
-git clone https://github.com/Jack6566/V_2rubby
+git clone https://github.com/Shantae86525/Rubika_Runway
 cd V_2rubby
 
 # ۲) محیط مجازی و نصب کتابخونه‌ها
