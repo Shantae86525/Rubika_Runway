@@ -23,6 +23,7 @@ import zipfile
 from datetime import datetime
 
 from telethon import TelegramClient, events, Button
+from telethon.errors import MessageNotModifiedError
 
 import config
 import crypto_util
@@ -108,6 +109,15 @@ async def log(text: str):
         print(f"[log error] {e}")
 
 
+async def safe_edit(obj, *args, **kwargs):
+    """Edit a message/callback, ignoring Telegram's 'content not modified'
+    error (raised when the new text+buttons equal what's already shown)."""
+    try:
+        return await obj.edit(*args, **kwargs)
+    except MessageNotModifiedError:
+        return None
+
+
 # --------------------------------------------------------------------------- #
 # Menus
 # --------------------------------------------------------------------------- #
@@ -148,7 +158,7 @@ async def home_cb(event):
     if not is_owner(event):
         return
     state.pop(event.sender_id, None)
-    await event.edit(WELCOME, buttons=main_menu(is_real_owner(event)))
+    await safe_edit(event, WELCOME, buttons=main_menu(is_real_owner(event)))
 
 
 @bot.on(events.CallbackQuery(data=b"cancel"))
@@ -162,7 +172,7 @@ async def cancel_cb(event):
         except Exception:
             pass
     state.pop(event.sender_id, None)
-    await event.edit("لغو شد. منوی اصلی:", buttons=main_menu(is_real_owner(event)))
+    await safe_edit(event, "لغو شد. منوی اصلی:", buttons=main_menu(is_real_owner(event)))
 
 
 # --------------------------------------------------------------------------- #
@@ -173,7 +183,7 @@ async def add_account_cb(event):
     if not is_owner(event):
         return
     state[event.sender_id] = {"step": "await_phone"}
-    await event.edit(
+    await safe_edit(event, 
         "📱 شماره اکانت روبیکای خودت رو بفرست.\nمثال: `09123456789`",
         buttons=[[Button.inline("🔙 لغو", b"cancel")]],
     )
@@ -188,7 +198,7 @@ async def accounts_cb(event):
         return
     accounts = db.list_accounts()
     if not accounts:
-        await event.edit(
+        await safe_edit(event, 
             "هنوز اکانتی اضافه نکردی.",
             buttons=[[Button.inline("➕ افزودن اکانت", b"add_account")],
                      [Button.inline("🔙 بازگشت", b"home")]],
@@ -200,7 +210,7 @@ async def accounts_cb(event):
         buttons.append([Button.inline(f"{i}- {acc['phone']}{mark}",
                                       f"acc_{acc['id']}".encode())])
     buttons.append([Button.inline("🔙 بازگشت", b"home")])
-    await event.edit("👤 اکانت‌های تو:", buttons=buttons)
+    await safe_edit(event, "👤 اکانت‌های تو:", buttons=buttons)
 
 
 @bot.on(events.CallbackQuery(pattern=b"acc_(\\d+)"))
@@ -227,7 +237,7 @@ async def account_menu_cb(event):
         [Button.inline("🗑 حذف اکانت", f"del_{account_id}".encode())],
         [Button.inline("🔙 بازگشت", b"accounts")],
     ]
-    await event.edit(text, buttons=buttons)
+    await safe_edit(event, text, buttons=buttons)
 
 
 @bot.on(events.CallbackQuery(pattern=b"del_(\\d+)"))
@@ -235,7 +245,7 @@ async def delete_confirm_cb(event):
     if not is_owner(event):
         return
     account_id = int(event.pattern_match.group(1))
-    await event.edit(
+    await safe_edit(event, 
         "از حذف این اکانت مطمئنی؟",
         buttons=[[Button.inline("✅ بله، حذف کن", f"delyes_{account_id}".encode())],
                  [Button.inline("🔙 خیر", f"acc_{account_id}".encode())]],
@@ -248,7 +258,7 @@ async def delete_do_cb(event):
         return
     account_id = int(event.pattern_match.group(1))
     db.delete_account(account_id)
-    await event.edit("اکانت حذف شد. ✅",
+    await safe_edit(event, "اکانت حذف شد. ✅",
                      buttons=[[Button.inline("🔙 بازگشت", b"accounts")]])
 
 
@@ -270,7 +280,7 @@ async def speed_cb(event):
     if not is_owner(event):
         return
     state[event.sender_id] = {"step": "await_delay"}
-    await event.edit(
+    await safe_edit(event, 
         f"⏱ تأخیر فعلی: {db.get_delay()} ثانیه\n{LINE}\n"
         "یک سرعت انتخاب کن، یا یک عدد بین ۰.۲ تا ۱۰ بفرست:",
         buttons=speed_buttons(),
@@ -284,7 +294,7 @@ async def speed_set_cb(event):
     value = config.clamp_delay(event.pattern_match.group(1).decode())
     db.set_delay(value)
     state.pop(event.sender_id, None)
-    await event.edit(f"✅ تأخیر روی {value} ثانیه تنظیم شد.",
+    await safe_edit(event, f"✅ تأخیر روی {value} ثانیه تنظیم شد.",
                      buttons=[[Button.inline("🔙 منوی اصلی", b"home")]])
 
 
@@ -382,14 +392,14 @@ async def send_menu_cb(event):
         return
     accounts = db.list_accounts()
     if not accounts:
-        await event.edit("اول یک اکانت اضافه کن.",
+        await safe_edit(event, "اول یک اکانت اضافه کن.",
                          buttons=[[Button.inline("➕ افزودن اکانت", b"add_account")],
                                   [Button.inline("🔙 بازگشت", b"home")]])
         return
     buttons = [[Button.inline(f"🚀 {a['phone']}", f"sm_{a['id']}".encode())]
                for a in accounts]
     buttons.append([Button.inline("🔙 بازگشت", b"home")])
-    await event.edit("با کدوم اکانت ارسال بشه؟", buttons=buttons)
+    await safe_edit(event, "با کدوم اکانت ارسال بشه؟", buttons=buttons)
 
 
 @bot.on(events.CallbackQuery(pattern=b"sm_(\\d+)"))
@@ -402,7 +412,7 @@ async def send_mode_cb(event):
     if not acc:
         await event.answer("اکانت پیدا نشد.", alert=True)
         return
-    await event.edit(
+    await safe_edit(event, 
         f"📤 نوع ارسال با اکانت {acc['phone']} رو انتخاب کن:",
         buttons=[
             [Button.inline("🚀 ارسال معمولی (به مخاطبین)", f"send_{account_id}".encode())],
@@ -602,14 +612,14 @@ async def send_prepare_cb(event):
     if w and not worker.is_local(w):
         await send_prepare_remote(event, acc, w, marker)
         return
-    await event.edit("⏳ در حال آماده‌سازی (اتصال، پیدا کردن پیام نشان‌دار، خواندن مخاطب‌ها) ...")
+    await safe_edit(event, "⏳ در حال آماده‌سازی (اتصال، پیدا کردن پیام نشان‌دار، خواندن مخاطب‌ها) ...")
 
     client = rb.open_client(acc["phone"])
     try:
         await rb.connect_ready(client)
         saved_guid, mid = await rb.find_marked_message(client, marker)
         if not mid:
-            await event.edit(
+            await safe_edit(event, 
                 f"❌ توی Saved Messages پیامی با مارکر «{marker}» پیدا نشد.\n"
                 "یه پیام (متن/عکس/فایل) توی Saved Messages بذار که آخر کپشنش این مارکر باشه.",
                 buttons=[[Button.inline("🔙 بازگشت", f"acc_{account_id}".encode())]],
@@ -617,7 +627,7 @@ async def send_prepare_cb(event):
             return
         ordered, stats = await rb.get_ordered_recipients(client)
     except Exception as e:  # noqa: BLE001
-        await event.edit(f"❌ خطا در آماده‌سازی: {e}",
+        await safe_edit(event, f"❌ خطا در آماده‌سازی: {e}",
                          buttons=[[Button.inline("🔙 بازگشت", f"acc_{account_id}".encode())]])
         return
     finally:
@@ -627,7 +637,7 @@ async def send_prepare_cb(event):
             pass
 
     if not ordered:
-        await event.edit("هیچ مخاطبی برای ارسال پیدا نشد.",
+        await safe_edit(event, "هیچ مخاطبی برای ارسال پیدا نشد.",
                          buttons=[[Button.inline("🔙 بازگشت", f"acc_{account_id}".encode())]])
         return
 
@@ -639,7 +649,7 @@ async def send_prepare_cb(event):
         "recipients": [r["guid"] for r in ordered],
     }
 
-    await event.edit(
+    await safe_edit(event, 
         card("🚀 آماده‌ی ارسال", [
             f"📎 محتوا : پیام نشان‌دار «{marker}» ✅",
             f"🎯 گیرنده‌ها : {len(ordered)} مخاطب",
@@ -665,7 +675,7 @@ async def send_go_cb(event):
     total = payload.get("total")
     if total is None:
         total = len(payload.get("recipients", []))
-    await event.edit(
+    await safe_edit(event, 
         f"⏳ شروع ارسال به {total} مخاطب ... گزارش‌ها در گروه لاگ میاد.",
         buttons=[[Button.inline("⏹ توقف ارسال", f"stop_{account_id}".encode())]],
     )
@@ -789,7 +799,7 @@ async def channel_start_cb(event):
         await event.answer("اکانت پیدا نشد.", alert=True)
         return
     state[event.sender_id] = {"step": "await_channel_name", "account_id": account_id}
-    await event.edit(
+    await safe_edit(event, 
         "📢 اسم کانالی که می‌خوای ساخته بشه رو بفرست:\nمثال: `تست ۱`",
         buttons=[[Button.inline("🔙 لغو", f"acc_{account_id}".encode())]],
     )
@@ -850,7 +860,7 @@ async def channel_create_local(event, acc, name, marker):
             except Exception:
                 forwarded = False
     except Exception as e:  # noqa: BLE001
-        await msg.edit(f"❌ خطا در ساخت کانال: {repr(e)[:160]}",
+        await safe_edit(msg, f"❌ خطا در ساخت کانال: {repr(e)[:160]}",
                        buttons=[[Button.inline("🔙 بازگشت", f"acc_{acc['id']}".encode())]])
         try:
             await client.disconnect()
@@ -867,7 +877,7 @@ async def channel_create_local(event, acc, name, marker):
         "account_id": acc["id"], "phone": acc["phone"], "channel_name": name,
         "channel_guid": channel_guid, "remote": False,
     }
-    await msg.edit(_channel_ready_card(name, marker, forwarded),
+    await safe_edit(msg, _channel_ready_card(name, marker, forwarded),
                    buttons=_channel_ready_buttons(acc["id"]))
 
 
@@ -879,7 +889,7 @@ async def channel_create_remote(event, acc, w, name, marker):
         pass
     w = db.get_worker(w["id"])
     if not (w and w["enabled"] and w["status"] == "ok"):
-        await msg.edit(
+        await safe_edit(msg, 
             f"❌ ورکر {w['tag'] if w else '?'} الان سالم/فعال نیست"
             f" (وضعیت: {w['status'] if w else 'نامشخص'}).\n"
             "این اکانت روی همین ورکر لاگین شده و فقط از همین‌جا می‌تونه کانال بسازه.",
@@ -890,18 +900,18 @@ async def channel_create_remote(event, acc, w, name, marker):
                                     {"phone": acc["phone"], "marker": marker,
                                      "title": name}, timeout=120)
     except Exception as e:  # noqa: BLE001
-        await msg.edit(f"❌ خطا در ساخت کانال روی ورکر: {repr(e)[:150]}",
+        await safe_edit(msg, f"❌ خطا در ساخت کانال روی ورکر: {repr(e)[:150]}",
                        buttons=[[Button.inline("🔙 بازگشت", f"acc_{acc['id']}".encode())]])
         return
     if not res.get("ok") or not res.get("channel_guid"):
-        await msg.edit("❌ ساخت کانال روی ورکر ناموفق بود.",
+        await safe_edit(msg, "❌ ساخت کانال روی ورکر ناموفق بود.",
                        buttons=[[Button.inline("🔙 بازگشت", f"acc_{acc['id']}".encode())]])
         return
     pending_channel[event.sender_id] = {
         "account_id": acc["id"], "phone": acc["phone"], "channel_name": name,
         "channel_guid": res["channel_guid"], "remote": True, "worker_id": w["id"],
     }
-    await msg.edit(_channel_ready_card(name, marker, res.get("forwarded")),
+    await safe_edit(msg, _channel_ready_card(name, marker, res.get("forwarded")),
                    buttons=_channel_ready_buttons(acc["id"]))
 
 
@@ -915,7 +925,7 @@ async def channel_add_cb(event):
         await event.answer("اطلاعات کانال منقضی شده. دوباره از «ارسال کانالی» شروع کن.",
                            alert=True)
         return
-    await event.edit(
+    await safe_edit(event, 
         f"⏳ شروع عضو کردن مخاطبین (دسته‌های {config.CHANNEL_ADD_BATCH}تایی تا سقف "
         f"{config.CHANNEL_MEMBER_TARGET}) ... گزارش در گروه لاگ میاد.")
     if payload.get("remote"):
@@ -1091,7 +1101,7 @@ async def marker_cb(event):
     if not is_owner(event):
         return
     state[event.sender_id] = {"step": "await_marker"}
-    await event.edit(
+    await safe_edit(event, 
         f"📌 مارکر فعلی: «{db.get_marker()}»\n{LINE}\n"
         "مارکر جدید رو بفرست (متنی که آخر کپشن پیام نشان‌دارت می‌ذاری):",
         buttons=[[Button.inline("🔙 بازگشت", b"home")]],
@@ -1124,7 +1134,7 @@ async def admins_cb(event):
     rows.append([Button.inline("🔙 بازگشت", b"home")])
     body = "\n".join(f"• {a['name'] or '-'} ({a['user_id']})" for a in admins) \
         if admins else "هنوز ادمینی اضافه نشده."
-    await event.edit("👥 مدیریت ادمین‌ها:\n" + body, buttons=rows)
+    await safe_edit(event, "👥 مدیریت ادمین‌ها:\n" + body, buttons=rows)
 
 
 @bot.on(events.CallbackQuery(data=b"admin_add"))
@@ -1133,7 +1143,7 @@ async def admin_add_cb(event):
         await event.answer("فقط مالک.", alert=True)
         return
     state[event.sender_id] = {"step": "await_admin_id"}
-    await event.edit(
+    await safe_edit(event, 
         "🆔 آیدی عددی تلگرام ادمین جدید رو بفرست (مثلاً `123456789`).\n"
         "می‌تونی اسم رو هم با فاصله بعدش بدی: `123456789 علی`",
         buttons=[[Button.inline("🔙 بازگشت", b"admins")]],
@@ -1239,7 +1249,7 @@ async def workers_cb(event):
     rows.append([Button.inline("➕ افزودن ورکر", b"wk_add"),
                  Button.inline("🔄 رفرش وضعیت", b"wk_refresh")])
     rows.append([Button.inline("🔙 بازگشت", b"home")])
-    await event.edit("🛠 مدیریت ورکرها\n(روی هر کدوم بزن برای جزئیات و مدیریت)", buttons=rows)
+    await safe_edit(event, "🛠 مدیریت ورکرها\n(روی هر کدوم بزن برای جزئیات و مدیریت)", buttons=rows)
 
 
 @bot.on(events.CallbackQuery(data=b"wk_refresh"))
@@ -1260,7 +1270,7 @@ async def wk_add_cb(event):
                            alert=True)
         return
     state[event.sender_id] = {"step": "wk_ip", "wk": {}}
-    await event.edit("🖥 آی‌پی سرور ورکر رو بفرست:",
+    await safe_edit(event, "🖥 آی‌پی سرور ورکر رو بفرست:",
                      buttons=[[Button.inline("🔙 لغو", b"workers")]])
 
 
@@ -1308,7 +1318,7 @@ async def provision_and_register(event, wk):
 
     async def progress(text):
         try:
-            await msg.edit(text)
+            await safe_edit(msg, text)
         except Exception:
             pass
 
@@ -1316,7 +1326,7 @@ async def provision_and_register(event, wk):
                                          wk["user"], wk["pass"],
                                          tag=tag, on_progress=progress)
     if not prov.get("ok"):
-        await msg.edit(f"❌ نصب ناموفق: {prov.get('error')}",
+        await safe_edit(msg, f"❌ نصب ناموفق: {prov.get('error')}",
                        buttons=[[Button.inline("🔙 بازگشت", b"workers")]])
         return
     wid = await worker.register_provisioned(wk["ip"], wk.get("port", 22),
@@ -1325,14 +1335,14 @@ async def provision_and_register(event, wk):
     # Give the freshly started container time to fully come up before the
     # first health check; checking immediately on connect gave a misleading
     # status. Wait 30s, then verify.
-    await msg.edit("⏳ ورکر نصب شد. ۳۰ ثانیه صبر برای آماده‌شدن کامل و بررسی وضعیت ...")
+    await safe_edit(msg, "⏳ ورکر نصب شد. ۳۰ ثانیه صبر برای آماده‌شدن کامل و بررسی وضعیت ...")
     await asyncio.sleep(30)
     try:
         await worker.check_worker(w)
     except Exception:
         pass
     w = db.get_worker(wid)
-    await msg.edit(f"✅ ورکر {w['tag']} اضافه و بررسی شد.",
+    await safe_edit(msg, f"✅ ورکر {w['tag']} اضافه و بررسی شد.",
                    buttons=[[Button.inline("🛠 مدیریت ورکر", b"workers")],
                             [Button.inline("🏠 منوی اصلی", b"home")]])
     await log(added_worker_card(w))
@@ -1376,7 +1386,7 @@ async def wk_detail_cb(event):
         rows.append([Button.inline(toggle, f"wktog_{wid}".encode())])
     rows.append([Button.inline("🔄 بررسی این ورکر", f"wkchk_{wid}".encode())])
     rows.append([Button.inline("🔙 بازگشت", b"workers")])
-    await event.edit("\n".join(lines), buttons=rows)
+    await safe_edit(event, "\n".join(lines), buttons=rows)
 
 
 @bot.on(events.CallbackQuery(pattern=b"wktog_(\\d+)"))
@@ -1406,7 +1416,7 @@ async def wk_restart_cb(event):
         await worker.close_tunnel(wid)
         await worker.restart_worker(w)
     except Exception as e:  # noqa: BLE001
-        await event.edit(f"❌ خطا در ری‌استارت: {repr(e)[:150]}",
+        await safe_edit(event, f"❌ خطا در ری‌استارت: {repr(e)[:150]}",
                          buttons=[[Button.inline("🔙 بازگشت", f"wk_{wid}".encode())]])
         return
     await wk_detail_cb(event)
@@ -1421,12 +1431,12 @@ async def wk_update_cb(event):
     if not w or w["is_master"]:
         await event.answer("روی مستر قابل اجرا نیست.", alert=True)
         return
-    await event.edit(f"⬆️ در حال آپدیت ورکر {w['tag']} (git pull + rebuild) ...")
+    await safe_edit(event, f"⬆️ در حال آپدیت ورکر {w['tag']} (git pull + rebuild) ...")
     try:
         await worker.close_tunnel(wid)
         await worker.update_worker(w)
     except Exception as e:  # noqa: BLE001
-        await event.edit(f"❌ خطا در آپدیت: {repr(e)[:150]}",
+        await safe_edit(event, f"❌ خطا در آپدیت: {repr(e)[:150]}",
                          buttons=[[Button.inline("🔙 بازگشت", f"wk_{wid}".encode())]])
         return
     await wk_detail_cb(event)
@@ -1453,7 +1463,7 @@ async def wk_del_confirm_cb(event):
     if not is_owner(event):
         return
     wid = int(event.pattern_match.group(1))
-    await event.edit(
+    await safe_edit(event, 
         "حذف کامل این ورکر؟ (کانتینر و سورس روی سرور هم پاک می‌شه)",
         buttons=[[Button.inline("✅ بله، حذف کن", f"wkdely_{wid}".encode())],
                  [Button.inline("🔙 خیر", f"wk_{wid}".encode())]],
@@ -1468,14 +1478,14 @@ async def wk_del_do_cb(event):
     w = db.get_worker(wid)
     if not w:
         return
-    await event.edit("🗑 در حال پاک‌سازی سرور و حذف ورکر ...")
+    await safe_edit(event, "🗑 در حال پاک‌سازی سرور و حذف ورکر ...")
     if not w["is_master"]:
         try:
             await worker.teardown_worker(w)
         except Exception:
             pass
     db.delete_worker(wid)
-    await event.edit(f"✅ ورکر {w['tag']} حذف شد.",
+    await safe_edit(event, f"✅ ورکر {w['tag']} حذف شد.",
                      buttons=[[Button.inline("🔙 بازگشت", b"workers")]])
 
 
@@ -1483,7 +1493,7 @@ async def wk_del_do_cb(event):
 # Remote send (account owned by a remote worker)
 # --------------------------------------------------------------------------- #
 async def send_prepare_remote(event, acc, w, marker):
-    await event.edit(f"⏳ بررسی ورکر {w['tag']} و آماده‌سازی ...")
+    await safe_edit(event, f"⏳ بررسی ورکر {w['tag']} و آماده‌سازی ...")
     # CHECK the worker right before using it.
     try:
         await worker.check_worker(w)
@@ -1491,7 +1501,7 @@ async def send_prepare_remote(event, acc, w, marker):
         pass
     w = db.get_worker(w["id"])
     if not (w and w["enabled"] and w["status"] == "ok"):
-        await event.edit(
+        await safe_edit(event, 
             f"❌ ورکر {w['tag'] if w else '?'} الان سالم/فعال نیست"
             f" (وضعیت: {w['status'] if w else 'نامشخص'}).\n"
             "این اکانت روی همین ورکر لاگین شده و فقط از همین‌جا می‌تونه بفرسته.",
@@ -1501,24 +1511,24 @@ async def send_prepare_remote(event, acc, w, marker):
         res = await worker.api_call(w, "POST", "/prepare",
                                     {"phone": acc["phone"], "marker": marker})
     except Exception as e:  # noqa: BLE001
-        await event.edit(f"❌ خطا در آماده‌سازی روی ورکر: {repr(e)[:150]}",
+        await safe_edit(event, f"❌ خطا در آماده‌سازی روی ورکر: {repr(e)[:150]}",
                          buttons=[[Button.inline("🔙 بازگشت", f"acc_{acc['id']}".encode())]])
         return
     if not res.get("marker_found"):
-        await event.edit(
+        await safe_edit(event, 
             f"❌ توی Saved Messages ورکر پیامی با مارکر «{marker}» نبود.",
             buttons=[[Button.inline("🔙 بازگشت", f"acc_{acc['id']}".encode())]])
         return
     total = res.get("total", 0)
     if total == 0:
-        await event.edit("هیچ مخاطبی پیدا نشد.",
+        await safe_edit(event, "هیچ مخاطبی پیدا نشد.",
                          buttons=[[Button.inline("🔙 بازگشت", f"acc_{acc['id']}".encode())]])
         return
     pending_send[event.sender_id] = {
         "account_id": acc["id"], "phone": acc["phone"],
         "remote": True, "worker_id": w["id"], "total": total,
     }
-    await event.edit(
+    await safe_edit(event, 
         card(f"🚀 آماده‌ی ارسال (ورکر {w['tag']})", [
             f"📎 محتوا : پیام نشان‌دار «{marker}» ✅",
             f"🎯 گیرنده‌ها : {total} مخاطب",
