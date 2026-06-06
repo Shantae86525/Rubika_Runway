@@ -33,8 +33,7 @@
 
 ```bash
 git clone https://github.com/Shantae86525/Rubika_Runway
-cd V_2rubby
-git checkout feature/worker-admin-system
+cd Rubika_Runway
 chmod +x setup.sh
 ./setup.sh
 ```
@@ -56,7 +55,7 @@ systemctl stop rubika-master        # توقف
 ```bash
 # ۱) گرفتن سورس
 git clone https://github.com/Shantae86525/Rubika_Runway
-cd V_2rubby
+cd Rubika_Runway
 
 # ۲) محیط مجازی و نصب کتابخونه‌ها
 python3 -m venv venv
@@ -135,8 +134,8 @@ Description=V2Rubby Master
 After=network-online.target
 
 [Service]
-WorkingDirectory=/root/V_2rubby
-ExecStart=/root/V_2rubby/venv/bin/python main.py
+WorkingDirectory=/root/Rubika_Runway
+ExecStart=/root/Rubika_Runway/venv/bin/python main.py
 Restart=always
 
 [Install]
@@ -162,7 +161,7 @@ sudo journalctl -u v2rubby -f      # دیدن لاگ‌ها
 ## آپدیت
 
 ```bash
-cd V_2rubby && git pull && pip install -r requirements.txt
+cd Rubika_Runway && git pull && pip install -r requirements.txt
 sudo systemctl restart v2rubby     # اگه با systemd اجرا کردی
 ```
 ورکرها رو هم از منوی **🛠 مدیریت ورکر → ⬆️ آپدیت** به‌روز کن.
