@@ -1,0 +1,19 @@
+# Optional: run a WORKER node with docker compose (the master's auto-provision
+# flow uses plain `docker run`, but this file is handy for manual setups).
+#
+#   1) put MODE=worker, WORKER_API_TOKEN=..., WORKER_API_PORT=8765 in .env
+#   2) docker compose up -d --build
+#
+# The API is published on loopback only; reach it from the master via SSH tunnel.
+services:
+  worker:
+    build: .
+    container_name: v2rubby-worker
+    restart: always
+    # host networking so the container uses the server's DNS/network (the
+    # default bridge network has broken DNS on many fresh servers). The API
+    # stays private via WORKER_BIND_HOST=127.0.0.1 in .env.
+    network_mode: host
+    env_file: .env
+    volumes:
+      - ./data:/app/data
