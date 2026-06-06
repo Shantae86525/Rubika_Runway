@@ -506,17 +506,29 @@ async def _try_call(fn, attempts):
     raise RuntimeError(f"signature mismatch: {last_err}")
 
 
-async def create_channel(client: Client, title: str, description: str = "") -> str:
-    """Create a channel and return its guid. Tolerant of rubpy version diffs."""
-    fn = getattr(client, "create_channel", None) or getattr(client, "add_channel", None)
+async def create_channel(client: Client, title: str, description: str = None) -> str:
+    """Create a channel and return its guid. Tolerant of rubpy version diffs.
+
+    IMPORTANT: never pass an empty-string description — Rubika's addChannel
+    rejects it with INVALID_INPUT. Omit it (None) when there is no description.
+    Verified against rubpy 7.3.5 where the method is `add_channel(title, ...)`.
+    """
+    fn = getattr(client, "add_channel", None) or getattr(client, "create_channel", None)
     if fn is None:
-        raise RuntimeError("this rubpy build has no create_channel()/add_channel()")
-    result = await _try_call(fn, [
-        lambda: ((), {"title": title, "description": description}),
-        lambda: ((title,), {}),
-        lambda: ((title, description), {}),
-        lambda: ((), {"title": title}),
-    ])
+        raise RuntimeError("this rubpy build has no add_channel()/create_channel()")
+    desc = description or None  # turn "" into None
+    if desc:
+        attempts = [
+            lambda: ((), {"title": title, "description": desc}),
+            lambda: ((title, desc), {}),
+            lambda: ((), {"title": title}),
+        ]
+    else:
+        attempts = [
+            lambda: ((), {"title": title}),
+            lambda: ((title,), {}),
+        ]
+    result = await _try_call(fn, attempts)
     guid = _channel_guid_of(result)
     if not guid:
         raise RuntimeError("channel created but its guid was not found in the response")
