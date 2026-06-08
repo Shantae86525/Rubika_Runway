@@ -162,14 +162,14 @@ async def safe_edit(obj, *args, **kwargs):
 # --------------------------------------------------------------------------- #
 def main_menu(owner: bool = True):
     rows = [
+        [Button.inline("🚀 ارسال", b"send_menu"),
+         Button.inline("🔁 اتومیشن", b"automation")],
         [Button.inline("➕ افزودن اکانت", b"add_account"),
-         Button.inline("👤 اکانت من", b"accounts")],
-        [Button.inline("🚀 ارسال", b"send_menu")],
-        [Button.inline("🔁 اتومیشن", b"automation")],
-        [Button.inline("🛠 مدیریت ورکر", b"workers"),
-         Button.inline("📌 تنظیم مارکر", b"marker")],
-        [Button.inline("⚙️ تنظیم سرعت ارسال", b"speed")],
-        [Button.inline("💾 بکاپ", b"backup")],
+         Button.inline("👤 اکانت‌های من", b"accounts")],
+        [Button.inline("📌 مارکر", b"marker"),
+         Button.inline("⚙️ سرعت ارسال", b"speed")],
+        [Button.inline("🛠 ورکرها", b"workers"),
+         Button.inline("💾 بکاپ", b"backup")],
     ]
     if owner:
         rows.append([Button.inline("👥 مدیریت ادمین", b"admins")])
@@ -261,17 +261,15 @@ async def account_menu_cb(event):
         await event.answer("اکانت پیدا نشد.", alert=True)
         return
     status = "فعال ✅" if acc["status"] == "active" else "غیرفعال ⚠️"
-    text = (
-        "╭───── 👤 اکانت ─────╮\n"
-        f"  نام    : {acc['name'] or '-'}\n"
-        f"  شماره  : {acc['phone']}\n"
-        f"  آیدی   : {acc['user_id']}\n"
-        f"  وضعیت  : {status}\n"
-        "╰────────────────────╯"
-    )
+    text = card("👤 اکانت", [
+        f"📛 نام : {acc['name'] or '-'}",
+        f"📱 شماره : {acc['phone']}",
+        f"🆔 آیدی : {acc['user_id']}",
+        f"⭐️ وضعیت : {status}",
+    ])
     buttons = [
-        [Button.inline("🚀 ارسال با این اکانت", f"send_{account_id}".encode())],
-        [Button.inline("📢 ارسال به شیوه کانال", f"chan_{account_id}".encode())],
+        [Button.inline("🚀 ارسال", f"send_{account_id}".encode()),
+         Button.inline("📢 کانال", f"chan_{account_id}".encode())],
         [Button.inline("🗑 حذف اکانت", f"del_{account_id}".encode())],
         [Button.inline("🔙 بازگشت", b"accounts")],
     ]
