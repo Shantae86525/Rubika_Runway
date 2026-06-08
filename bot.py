@@ -489,6 +489,8 @@ async def message_router(event):
         await handle_auto_text(event)
     elif step == "await_auto_interval":
         await handle_auto_interval(event)
+    elif step == "await_auto_link":
+        await handle_auto_link(event)
     elif step == "await_admin_id":
         await handle_admin_id(event)
     elif step in ("wk_ip", "wk_port", "wk_user", "wk_pass"):
@@ -1797,6 +1799,7 @@ async def automation_account_cb(event):
     rows = [
         [Button.inline("➕ افزودن متن", f"auadd_{account_id}".encode()),
          Button.inline("🗑 پاک‌کردن متن‌ها", f"auclr_{account_id}".encode())],
+        [Button.inline("🔗 لیست گروه‌ها", f"aulnk_{account_id}".encode())],
         [Button.inline("⏱ تنظیم فاصله", f"auint_{account_id}".encode())],
         [Button.inline("⏹ خاموش‌کردن" if on else "▶️ روشن‌کردن",
                        f"autog_{account_id}".encode())],
@@ -1910,6 +1913,134 @@ async def automation_toggle_cb(event):
     await automation_account_cb(event)
 
 
+# ---- per-account group-link list: this ONE account joins your personal groups ----
+@bot.on(events.CallbackQuery(pattern=b"aulnk_(\\d+)"))
+async def automation_links_cb(event):
+    if not is_owner(event):
+        return
+    state.pop(event.sender_id, None)
+    account_id = int(event.pattern_match.group(1))
+    acc = db.get_account(account_id)
+    if not acc:
+        await event.answer("اکانت پیدا نشد.", alert=True)
+        return
+    links = db.list_automation_links(account_id)
+    body = "\n".join(f"• {ln}" for ln in links) if links else "هنوز لینکی اضافه نشده."
+    lines = [f"🔗 لیست گروه‌های {acc['phone']}", LINE, body, LINE,
+             "می‌تونی لینک گروه‌های شخصی‌ت رو اضافه کنی، بعد «عضو شو» بزنی تا "
+             "همین اکانت عضوشون بشه."]
+    rows = [
+        [Button.inline("➕ افزودن لینک", f"auladd_{account_id}".encode()),
+         Button.inline("🗑 پاک‌کردن", f"aulclr_{account_id}".encode())],
+        [Button.inline("✅ عضو شو", f"auljoin_{account_id}".encode())],
+        [Button.inline("🔙 بازگشت", f"auto_{account_id}".encode())],
+    ]
+    await safe_edit(event, "\n".join(lines), buttons=rows)
+
+
+@bot.on(events.CallbackQuery(pattern=b"auladd_(\\d+)"))
+async def automation_link_add_cb(event):
+    if not is_owner(event):
+        return
+    account_id = int(event.pattern_match.group(1))
+    state[event.sender_id] = {"step": "await_auto_link", "account_id": account_id}
+    await safe_edit(event, "🔗 لینک گروه روبیکا رو بفرست (می‌تونی چند تا پشت‌هم بفرستی):",
+                    buttons=[[Button.inline("✅ تمام / بازگشت", f"aulnk_{account_id}".encode())]])
+
+
+async def handle_auto_link(event):
+    st = state.get(event.sender_id)
+    if not st:
+        return
+    account_id = st.get("account_id")
+    link = event.raw_text.strip()
+    if not link.startswith("http"):
+        await event.respond("یه لینکِ معتبر بفرست (با https شروع شه).")
+        return
+    db.add_automation_link(account_id, link)
+    n = len(db.list_automation_links(account_id))
+    await event.respond(
+        f"✅ لینک اضافه شد (مجموع: {n}). لینک بعدی رو بفرست یا برگرد.",
+        buttons=[[Button.inline("✅ تمام / بازگشت", f"aulnk_{account_id}".encode())]])
+
+
+@bot.on(events.CallbackQuery(pattern=b"aulclr_(\\d+)"))
+async def automation_link_clear_cb(event):
+    if not is_owner(event):
+        return
+    account_id = int(event.pattern_match.group(1))
+    db.clear_automation_links(account_id)
+    await event.answer("لینک‌ها پاک شد.")
+    await automation_links_cb(event)
+
+
+@bot.on(events.CallbackQuery(pattern=b"auljoin_(\\d+)"))
+async def automation_link_join_cb(event):
+    if not is_owner(event):
+        return
+    account_id = int(event.pattern_match.group(1))
+    acc = db.get_account(account_id)
+    if not acc:
+        await event.answer("اکانت پیدا نشد.", alert=True)
+        return
+    links = db.list_automation_links(account_id)
+    if not links:
+        await event.answer("اول حداقل یه لینک اضافه کن.", alert=True)
+        return
+    if automation_on(account_id):
+        await event.answer("اتومیشن این اکانت روشنه. اول خاموشش کن، بعد «عضو شو» بزن.",
+                           alert=True)
+        return
+    if account_id in active_jobs:
+        await event.answer("این اکانت الان مشغوله. صبر کن.", alert=True)
+        return
+    await safe_edit(event, f"⏳ {acc['phone']} داره عضو {len(links)} گروه می‌شه ... "
+                    "گزارش در گروه لاگ میاد.")
+    asyncio.create_task(run_group_join(acc, links))
+
+
+async def run_group_join(acc: dict, links: list):
+    account_id = acc["id"]
+    phone = acc["phone"]
+    active_jobs.add(account_id)
+    joined = 0
+    failed = 0
+    try:
+        w = worker.worker_for_account(acc)
+        if w and not worker.is_local(w):
+            res = await worker.api_call(w, "POST", "/group/join",
+                                        {"phone": phone, "links": links}, timeout=600)
+            joined = res.get("joined", 0)
+            failed = res.get("failed", 0)
+        else:
+            client = rb.open_client(phone)
+            try:
+                await rb.connect_ready(client)
+                for link in links:
+                    try:
+                        await asyncio.wait_for(rb.join_group_by_link(client, link),
+                                               timeout=60)
+                        joined += 1
+                    except Exception:
+                        failed += 1
+                    await asyncio.sleep(config.GROUP_JOIN_DELAY)
+            finally:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+    except Exception as e:  # noqa: BLE001
+        await log(f"⚠️ عضو شدن در گروه‌های «{phone}» ناقص ماند: {repr(e)[:150]}")
+    finally:
+        active_jobs.discard(account_id)
+    await log(card("🔗 GROUP JOIN", [
+        f"👤 Account : {phone}",
+        f"✅ Joined : {joined}",
+        f"❌ Failed : {failed}",
+        f"🕒 {now()}",
+    ]))
+
+
 async def run_automation_local(account_id: int, phone: str, st: dict):
     """Local automation loop: every interval send a random text to each group
     (tiny random pause between groups). A group is muted only after 3 failures
@@ -1946,14 +2077,18 @@ async def run_automation_local(account_id: int, phone: str, st: dict):
                 try:
                     await asyncio.wait_for(
                         rb.send_text(client, guid, txt), timeout=config.SEND_TIMEOUT)
-                    st["sent"] += 1
-                    db.incr_automation_sent(account_id, 1)
-                    last_text[guid] = idx
-                    fails[guid] = 0
                 except Exception:
                     fails[guid] = fails.get(guid, 0) + 1
                     if fails[guid] >= 3:
                         st["skipped"].add(guid)   # mute after repeated failures
+                else:
+                    st["sent"] += 1
+                    last_text[guid] = idx
+                    fails[guid] = 0
+                    try:                       # a brief DB lock must NOT count as a send error
+                        db.incr_automation_sent(account_id, 1)
+                    except Exception:
+                        pass
                 await asyncio.sleep(random.uniform(
                     config.AUTOMATION_GROUP_DELAY_MIN,
                     config.AUTOMATION_GROUP_DELAY_MAX))
@@ -1995,6 +2130,10 @@ async def start_automation(acc: dict):
     old = automation_tasks.pop(account_id, None)
     if old:
         old["state"]["stop"] = True
+        try:                                  # let the old loop fully stop first
+            await asyncio.wait_for(old["task"], timeout=5)
+        except Exception:
+            pass
     st = {"stop": False, "sent": 0, "groups": 0, "skipped": set(),
           "texts": texts, "interval": interval}
     task = asyncio.create_task(run_automation_local(account_id, acc["phone"], st))

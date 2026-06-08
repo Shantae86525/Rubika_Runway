@@ -68,6 +68,9 @@ AUTOMATION_GROUP_DELAY_MAX = _float("AUTOMATION_GROUP_DELAY_MAX", 2.0)
 # How often (seconds) the master posts the per-account automation summary.
 AUTOMATION_SUMMARY_INTERVAL = _int("AUTOMATION_SUMMARY_INTERVAL", 1200)  # 20 min
 
+# Pause (seconds) between joining each personal group from the link list.
+GROUP_JOIN_DELAY = _float("GROUP_JOIN_DELAY", 3.0)
+
 # Version label shown in the startup "Online" log card.
 VERSION = os.getenv("VERSION", "V1")
 

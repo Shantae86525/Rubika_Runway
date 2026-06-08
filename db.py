@@ -116,6 +116,15 @@ def init():
         )
         """
     )
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS automation_links (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id INTEGER,
+            link       TEXT
+        )
+        """
+    )
 
     # ---- migration: add accounts.worker_id (account -> worker affinity) ----
     cols = [r["name"] for r in c.execute("PRAGMA table_info(accounts)").fetchall()]
@@ -168,6 +177,7 @@ def delete_account(account_id: int):
     conn.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
     conn.execute("DELETE FROM automation WHERE account_id = ?", (account_id,))
     conn.execute("DELETE FROM automation_texts WHERE account_id = ?", (account_id,))
+    conn.execute("DELETE FROM automation_links WHERE account_id = ?", (account_id,))
     conn.commit()
     conn.close()
 
@@ -463,5 +473,29 @@ def list_automation_texts(account_id: int) -> list:
 def clear_automation_texts(account_id: int):
     conn = _conn()
     conn.execute("DELETE FROM automation_texts WHERE account_id = ?", (int(account_id),))
+    conn.commit()
+    conn.close()
+
+
+def add_automation_link(account_id: int, link: str):
+    conn = _conn()
+    conn.execute("INSERT INTO automation_links (account_id, link) VALUES (?, ?)",
+                 (int(account_id), link))
+    conn.commit()
+    conn.close()
+
+
+def list_automation_links(account_id: int) -> list:
+    conn = _conn()
+    rows = conn.execute(
+        "SELECT link FROM automation_links WHERE account_id = ? ORDER BY id",
+        (int(account_id),)).fetchall()
+    conn.close()
+    return [r["link"] for r in rows]
+
+
+def clear_automation_links(account_id: int):
+    conn = _conn()
+    conn.execute("DELETE FROM automation_links WHERE account_id = ?", (int(account_id),))
     conn.commit()
     conn.close()

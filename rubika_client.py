@@ -611,3 +611,34 @@ async def get_group_guids(client: Client) -> list:
         if not start_id or not chats:
             break
     return out
+
+
+async def join_group_by_link(client: Client, link: str):
+    """Join a group/channel via its invite link. Tolerant of rubpy diffs:
+    tries join_group / join_chat / join_channel_by_link with link or hash."""
+    link = (link or "").strip()
+    if not link:
+        raise RuntimeError("empty link")
+    # the join "hash" is the last path segment of the invite link
+    hash_part = link.rstrip("/").split("/")[-1]
+    candidates = ("join_group", "join_chat", "join_channel_by_link",
+                  "join_channel_action")
+    last_err = None
+    for name in candidates:
+        fn = getattr(client, name, None)
+        if fn is None:
+            continue
+        for arg in (link, hash_part):
+            for make in (lambda a=arg: ((a,), {}),
+                         lambda a=arg: ((), {"link": a}),
+                         lambda a=arg: ((), {"hash": a})):
+                args, kwargs = make()
+                try:
+                    return await fn(*args, **kwargs)
+                except TypeError as e:
+                    last_err = e
+                    continue
+                except Exception as e:   # wrong arg value for THIS method; try next
+                    last_err = e
+                    break
+    raise RuntimeError(f"could not join via link: {last_err}")

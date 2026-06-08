@@ -85,6 +85,10 @@ def _build_app():
         texts: list = []
         interval: int = 30
 
+    class GroupJoinIn(BaseModel):
+        phone: str
+        links: list = []
+
     class PrepareIn(BaseModel):
         phone: str
         marker: str
@@ -293,6 +297,28 @@ def _build_app():
             return {"running": False, "sent": 0, "groups": 0, "skipped": 0}
         return {"running": not st["stop"], "sent": st["sent"],
                 "groups": st["groups"], "skipped": len(st["skipped"])}
+
+    @app.post("/group/join")
+    async def group_join(body: GroupJoinIn, authorization: str = Header(None)):
+        _auth(authorization)
+        client = rb.open_client(body.phone)
+        joined = 0
+        failed = 0
+        try:
+            await rb.connect_ready(client)
+            for link in (body.links or []):
+                try:
+                    await asyncio.wait_for(rb.join_group_by_link(client, link), timeout=60)
+                    joined += 1
+                except Exception:
+                    failed += 1
+                await asyncio.sleep(config.GROUP_JOIN_DELAY)
+            return {"ok": True, "joined": joined, "failed": failed}
+        finally:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
 
     return app
 
