@@ -1888,8 +1888,15 @@ async def automation_toggle_cb(event):
         if account_id in active_jobs:
             await event.answer("این اکانت الان در حال ارساله. صبر کن تموم شه.", alert=True)
             return
+        # start FIRST; only mark enabled if it actually launched (so a dead/old
+        # worker can't leave the account stuck in a broken "on" state).
+        try:
+            await start_automation(acc)
+        except Exception as e:  # noqa: BLE001
+            await event.answer(f"شروع اتومیشن ناموفق: {repr(e)[:120]}\n"
+                               "اگه اکانت روی ورکره، اول ورکر رو آپدیت کن.", alert=True)
+            return
         db.set_automation_enabled(account_id, True)
-        await start_automation(acc)
         await log(card("🔁 AUTOMATION ON", [
             f"👤 Account : {acc['phone']}",
             f"⏱ Interval : {au['interval_sec']}s",
