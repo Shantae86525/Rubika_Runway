@@ -574,3 +574,40 @@ async def seed_channel_with_contacts(client: Client, channel_guid: str,
         if i + batch < len(guids):
             await asyncio.sleep(delay)
     return added
+
+
+# --------------------------------------------------------------------------- #
+# Plain text send + group listing (for the Automation feature).
+# Verified against rubpy 7.3.5: send_message(object_guid, text=...).
+# --------------------------------------------------------------------------- #
+async def send_text(client: Client, object_guid: str, text: str):
+    """Send a plain text message to a chat/group. Tolerant of rubpy diffs."""
+    fn = getattr(client, "send_message", None)
+    if fn is None:
+        raise RuntimeError("this rubpy build has no send_message()")
+    return await _try_call(fn, [
+        lambda: ((object_guid, text), {}),
+        lambda: ((), {"object_guid": object_guid, "text": text}),
+    ])
+
+
+async def get_group_guids(client: Client) -> list:
+    """Return ALL groups the account is in as {guid, name}, paginated."""
+    out = []
+    seen = set()
+    start_id = None
+    for _ in range(200):  # safety cap
+        result = await client.get_chats(start_id) if start_id else await client.get_chats()
+        chats = getattr(result, "chats", None)
+        if chats is None and isinstance(result, dict):
+            chats = result.get("chats", [])
+        for ch in chats or []:
+            if _type_of(ch) == "group":
+                g = _guid_of(ch)
+                if g and g not in seen:
+                    seen.add(g)
+                    out.append({"guid": g, "name": _name_of(ch)})
+        start_id = _next_start_id(result)
+        if not start_id or not chats:
+            break
+    return out

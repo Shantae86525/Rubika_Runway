@@ -95,6 +95,28 @@ def init():
         """
     )
 
+    # ---- Automation tables (rotating texts to an account's groups) ----
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS automation (
+            account_id   INTEGER PRIMARY KEY,
+            enabled      INTEGER DEFAULT 0,
+            interval_sec INTEGER DEFAULT 30,
+            sent_total   INTEGER DEFAULT 0,
+            updated_at   TEXT
+        )
+        """
+    )
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS automation_texts (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id INTEGER,
+            text       TEXT
+        )
+        """
+    )
+
     # ---- migration: add accounts.worker_id (account -> worker affinity) ----
     cols = [r["name"] for r in c.execute("PRAGMA table_info(accounts)").fetchall()]
     if "worker_id" not in cols:
@@ -144,6 +166,8 @@ def get_account(account_id: int):
 def delete_account(account_id: int):
     conn = _conn()
     conn.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
+    conn.execute("DELETE FROM automation WHERE account_id = ?", (account_id,))
+    conn.execute("DELETE FROM automation_texts WHERE account_id = ?", (account_id,))
     conn.commit()
     conn.close()
 
@@ -357,3 +381,87 @@ def worker_sent_today(worker_id: int) -> int:
     ).fetchone()
     conn.close()
     return int(row["sent"]) if row else 0
+
+
+# --------------------------------------------------------------------------- #
+# Automation (rotating texts to an account's groups). One row per account.
+# --------------------------------------------------------------------------- #
+def _ensure_automation_row(c, account_id: int):
+    c.execute(
+        "INSERT OR IGNORE INTO automation (account_id, enabled, interval_sec, "
+        "sent_total, updated_at) VALUES (?, 0, 30, 0, ?)",
+        (int(account_id), _now()),
+    )
+
+
+def get_automation(account_id: int) -> dict:
+    conn = _conn()
+    c = conn.cursor()
+    _ensure_automation_row(c, account_id)
+    conn.commit()
+    row = c.execute("SELECT * FROM automation WHERE account_id = ?",
+                    (int(account_id),)).fetchone()
+    conn.close()
+    return dict(row) if row else {"account_id": account_id, "enabled": 0,
+                                  "interval_sec": 30, "sent_total": 0}
+
+
+def set_automation_enabled(account_id: int, enabled: bool):
+    conn = _conn()
+    c = conn.cursor()
+    _ensure_automation_row(c, account_id)
+    c.execute("UPDATE automation SET enabled = ?, updated_at = ? WHERE account_id = ?",
+              (1 if enabled else 0, _now(), int(account_id)))
+    conn.commit()
+    conn.close()
+
+
+def set_automation_interval(account_id: int, interval_sec: int):
+    conn = _conn()
+    c = conn.cursor()
+    _ensure_automation_row(c, account_id)
+    c.execute("UPDATE automation SET interval_sec = ?, updated_at = ? WHERE account_id = ?",
+              (config.clamp_interval(interval_sec), _now(), int(account_id)))
+    conn.commit()
+    conn.close()
+
+
+def incr_automation_sent(account_id: int, n: int = 1):
+    conn = _conn()
+    c = conn.cursor()
+    _ensure_automation_row(c, account_id)
+    c.execute("UPDATE automation SET sent_total = sent_total + ? WHERE account_id = ?",
+              (int(n), int(account_id)))
+    conn.commit()
+    conn.close()
+
+
+def list_enabled_automations() -> list:
+    conn = _conn()
+    rows = conn.execute("SELECT * FROM automation WHERE enabled = 1").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def add_automation_text(account_id: int, text: str):
+    conn = _conn()
+    conn.execute("INSERT INTO automation_texts (account_id, text) VALUES (?, ?)",
+                 (int(account_id), text))
+    conn.commit()
+    conn.close()
+
+
+def list_automation_texts(account_id: int) -> list:
+    conn = _conn()
+    rows = conn.execute(
+        "SELECT text FROM automation_texts WHERE account_id = ? ORDER BY id",
+        (int(account_id),)).fetchall()
+    conn.close()
+    return [r["text"] for r in rows]
+
+
+def clear_automation_texts(account_id: int):
+    conn = _conn()
+    conn.execute("DELETE FROM automation_texts WHERE account_id = ?", (int(account_id),))
+    conn.commit()
+    conn.close()

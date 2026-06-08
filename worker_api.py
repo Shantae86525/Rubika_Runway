@@ -20,6 +20,7 @@ It binds to loopback only; the master maps a local port to it via SSH, so the
 API is never exposed to the public internet.
 """
 import asyncio
+import random
 import uuid
 
 import config
@@ -44,6 +45,7 @@ except ImportError:  # pragma: no cover
 # --------------------------------------------------------------------------- #
 _login_ctx: dict = {}   # phone -> rubpy login context dict
 _jobs: dict = {}        # job_id -> job state dict
+_automations: dict = {}  # phone -> automation state dict
 
 
 def _build_app():
@@ -75,6 +77,13 @@ def _build_app():
         delay: float = 1.0
         max_errors: int = 3
         send_timeout: int = 60
+        resume_wait: int = 300
+        max_retries: int = 2
+
+    class AutomationIn(BaseModel):
+        phone: str
+        texts: list = []
+        interval: int = 30
 
     class PrepareIn(BaseModel):
         phone: str
@@ -232,7 +241,8 @@ def _build_app():
 
         job_id = uuid.uuid4().hex[:12]
         job = {"phone": body.phone, "total": len(recipients), "ok": 0, "fail": 0,
-               "done": False, "stopped": False, "reason": None}
+               "done": False, "stopped": False, "reason": None,
+               "retry_count": 0, "state": "sending"}
         _jobs[job_id] = job
         asyncio.create_task(_run_send(client, job, saved_guid, mid, recipients, body))
         return {"ok": True, "marker_found": True, "job_id": job_id,
@@ -254,30 +264,171 @@ def _build_app():
             job["stopped"] = True
         return {"stopped": True}
 
+    # ----- automation (rotating texts to the account's groups) -----
+    @app.post("/automation/start")
+    async def automation_start(body: AutomationIn, authorization: str = Header(None)):
+        _auth(authorization)
+        # idempotent: stop any existing loop for this phone first
+        await _stop_automation(body.phone)
+        state = {"stop": False, "sent": 0, "groups": 0, "skipped": set(),
+                 "texts": list(body.texts or []),
+                 "interval": config.clamp_interval(body.interval), "task": None}
+        if not state["texts"]:
+            return {"ok": False, "error": "no texts"}
+        state["task"] = asyncio.create_task(_run_automation(body.phone, state))
+        _automations[rb.normalize_phone(body.phone)] = state
+        return {"ok": True}
+
+    @app.post("/automation/stop")
+    async def automation_stop(body: AutomationIn, authorization: str = Header(None)):
+        _auth(authorization)
+        sent = await _stop_automation(body.phone)
+        return {"ok": True, "sent": sent}
+
+    @app.get("/automation/status")
+    async def automation_status(phone: str, authorization: str = Header(None)):
+        _auth(authorization)
+        st = _automations.get(rb.normalize_phone(phone))
+        if not st:
+            return {"running": False, "sent": 0, "groups": 0, "skipped": 0}
+        return {"running": not st["stop"], "sent": st["sent"],
+                "groups": st["groups"], "skipped": len(st["skipped"])}
+
     return app
 
 
-async def _run_send(client, job: dict, saved_guid, mid, recipients, body):
-    """Mirror of the master's send loop, but driven by the worker. Calls the
-    UNCHANGED rb.forward_message for every recipient."""
+async def _stop_automation(phone: str) -> int:
+    """Stop a running automation for a phone; return how many it had sent."""
+    st = _automations.pop(rb.normalize_phone(phone), None)
+    if not st:
+        return 0
+    st["stop"] = True
+    task = st.get("task")
+    if task:
+        try:
+            await asyncio.wait_for(task, timeout=10)
+        except Exception:
+            task.cancel()
+    return st.get("sent", 0)
+
+
+def _pick_text(texts: list, last_idx):
+    """Random text index, avoiding the same one as last time (if possible)."""
+    if not texts:
+        return None, None
+    if len(texts) == 1:
+        return 0, texts[0]
+    choices = [i for i in range(len(texts)) if i != last_idx]
+    i = random.choice(choices)
+    return i, texts[i]
+
+
+async def _run_automation(phone: str, state: dict):
+    """Worker-side automation loop: every interval, send a random text to each
+    group (with a tiny random pause between groups). Skips groups that error."""
+    client = rb.open_client(phone)
+    last_text: dict = {}
     try:
-        for guid in recipients:
+        await rb.connect_ready(client)
+        while not state["stop"]:
+            try:
+                groups = await rb.get_group_guids(client)
+            except Exception:
+                groups = []
+            state["groups"] = len(groups)
+            for g in groups:
+                if state["stop"]:
+                    break
+                guid = g["guid"]
+                if guid in state["skipped"]:
+                    continue
+                idx, txt = _pick_text(state["texts"], last_text.get(guid))
+                if txt is None:
+                    break
+                try:
+                    await rb.send_text(client, guid, txt)
+                    state["sent"] += 1
+                    last_text[guid] = idx
+                except Exception:
+                    state["skipped"].add(guid)  # mute a failing group
+                await asyncio.sleep(random.uniform(
+                    config.AUTOMATION_GROUP_DELAY_MIN,
+                    config.AUTOMATION_GROUP_DELAY_MAX))
+            waited = 0
+            while waited < state["interval"] and not state["stop"]:
+                await asyncio.sleep(1)
+                waited += 1
+    except Exception:
+        pass
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+
+async def _sleep_with_stop(job: dict, seconds: float, step: float = 2.0):
+    """Sleep up to `seconds`, but bail out early if the job is stopped."""
+    waited = 0.0
+    while waited < seconds:
+        if job.get("stopped"):
+            return
+        d = min(step, seconds - waited)
+        await asyncio.sleep(d)
+        waited += d
+
+
+async def _run_send(client, job: dict, saved_guid, mid, recipients, body):
+    """Worker send loop with auto-resume: on hitting max_errors, wait
+    body.resume_wait and resume from the rest of the list, up to
+    body.max_retries times. Manual stop ends immediately. Calls the UNCHANGED
+    rb.forward_message for every recipient."""
+    n = len(recipients)
+    idx = 0
+    try:
+        while True:
+            attempt_fail = 0
+            hit_max = False
+            while idx < n:
+                if job["stopped"]:
+                    job["reason"] = "manual_stop"
+                    return
+                guid = recipients[idx]
+                idx += 1
+                try:
+                    await asyncio.wait_for(
+                        rb.forward_message(client, saved_guid, guid, mid),
+                        timeout=body.send_timeout,
+                    )
+                    job["ok"] += 1
+                except Exception as e:  # noqa: BLE001
+                    job["fail"] += 1
+                    attempt_fail += 1
+                    job["last_error"] = repr(e)[:200]
+                    if attempt_fail >= body.max_errors:
+                        hit_max = True
+                        break
+                await _sleep_with_stop(job, body.delay)
+
+            if not hit_max:
+                break  # finished the whole list
+            if job["retry_count"] >= body.max_retries:
+                job["reason"] = f"max_errors({body.max_errors})"
+                break
+            # wait, then reconnect a fresh client and resume from `idx`
+            job["retry_count"] += 1
+            job["state"] = "waiting"
+            await _sleep_with_stop(job, body.resume_wait)
             if job["stopped"]:
                 job["reason"] = "manual_stop"
                 break
+            job["state"] = "sending"
             try:
-                await asyncio.wait_for(
-                    rb.forward_message(client, saved_guid, guid, mid),
-                    timeout=body.send_timeout,
-                )
-                job["ok"] += 1
-            except Exception as e:  # noqa: BLE001
-                job["fail"] += 1
-                job["last_error"] = repr(e)[:200]
-                if job["fail"] >= body.max_errors:
-                    job["reason"] = f"max_errors({body.max_errors})"
-                    break
-            await asyncio.sleep(body.delay)
+                await client.disconnect()
+            except Exception:
+                pass
+            client = rb.open_client(body.phone)
+            await rb.connect_ready(client)
     except Exception as e:  # noqa: BLE001
         job["reason"] = f"fatal: {repr(e)[:200]}"
     finally:

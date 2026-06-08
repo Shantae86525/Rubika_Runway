@@ -18,6 +18,7 @@ Panel text is Persian. Only the configured owner id may use it.
 """
 import asyncio
 import os
+import random
 import tempfile
 import zipfile
 from datetime import datetime
@@ -83,6 +84,44 @@ pending_send: dict = {}
 pending_channel: dict = {}
 # stop flags per account id
 stop_flags: dict = {}
+# accounts currently running a send/channel job (in-memory busy lock)
+active_jobs: set = set()
+# running LOCAL automation tasks: account_id -> {"task":Task, "state":dict}
+automation_tasks: dict = {}
+
+
+def _alert_word(n: int) -> str:
+    return {1: "ONE", 2: "TWO", 3: "THREE"}.get(n, str(n))
+
+
+async def _wait_or_stop(account_id: int, seconds: float, step: float = 2.0) -> bool:
+    """Sleep up to `seconds`; return True early if a manual stop was requested."""
+    waited = 0.0
+    while waited < seconds:
+        if stop_flags.get(account_id):
+            return True
+        d = min(step, seconds - waited)
+        await asyncio.sleep(d)
+        waited += d
+    return False
+
+
+def automation_on(account_id: int) -> bool:
+    try:
+        return bool(db.get_automation(account_id).get("enabled"))
+    except Exception:
+        return False
+
+
+def _pick_text(texts: list, last_idx):
+    """Random text index, avoiding the same one as last time (if possible)."""
+    if not texts:
+        return None, None
+    if len(texts) == 1:
+        return 0, texts[0]
+    choices = [i for i in range(len(texts)) if i != last_idx]
+    i = random.choice(choices)
+    return i, texts[i]
 
 
 def is_owner(event) -> bool:
@@ -126,6 +165,7 @@ def main_menu(owner: bool = True):
         [Button.inline("➕ افزودن اکانت", b"add_account"),
          Button.inline("👤 اکانت من", b"accounts")],
         [Button.inline("🚀 ارسال", b"send_menu")],
+        [Button.inline("🔁 اتومیشن", b"automation")],
         [Button.inline("🛠 مدیریت ورکر", b"workers"),
          Button.inline("📌 تنظیم مارکر", b"marker")],
         [Button.inline("⚙️ تنظیم سرعت ارسال", b"speed")],
@@ -447,6 +487,10 @@ async def message_router(event):
         await handle_marker(event)
     elif step == "await_channel_name":
         await handle_channel_name(event)
+    elif step == "await_auto_text":
+        await handle_auto_text(event)
+    elif step == "await_auto_interval":
+        await handle_auto_interval(event)
     elif step == "await_admin_id":
         await handle_admin_id(event)
     elif step in ("wk_ip", "wk_port", "wk_user", "wk_pass"):
@@ -606,6 +650,11 @@ async def send_prepare_cb(event):
     if not acc:
         await event.answer("اکانت پیدا نشد.", alert=True)
         return
+    if automation_on(account_id):
+        await safe_edit(event,
+            "🔁 اتومیشن این اکانت روشنه. اول از بخش «🔁 اتومیشن» خاموشش کن، بعد ارسال بزن.",
+            buttons=[[Button.inline("🔙 بازگشت", f"acc_{account_id}".encode())]])
+        return
     marker = db.get_marker()
     # Route to the worker that OWNS this account (session affinity).
     w = worker.worker_for_account(acc)
@@ -710,6 +759,7 @@ async def run_send(owner_id: int, payload: dict):
     fail = 0
     started = datetime.now()
     reason = None
+    active_jobs.add(account_id)
 
     await log(card("SEND STARTED 🚀", [
         f"🛠 Count : {count:03d}",
@@ -721,30 +771,65 @@ async def run_send(owner_id: int, payload: dict):
         f"📌 Marker : «{marker}» Found ✅",
     ]))
 
+    n = total
+    idx = 0
+    retry_count = 0
     client = rb.open_client(phone)
     try:
         await rb.connect_ready(client)
-        for guid in recipients:
-            if stop_flags.get(account_id):
+        while True:
+            attempt_fail = 0
+            hit_max = False
+            while idx < n:
+                if stop_flags.get(account_id):
+                    reason = "توقف دستی توسط کاربر"
+                    break
+                guid = recipients[idx]
+                idx += 1
+                try:
+                    await asyncio.wait_for(
+                        rb.forward_message(client, saved_guid, guid, mid),
+                        timeout=config.SEND_TIMEOUT,
+                    )
+                    ok += 1
+                except Exception as e:  # noqa: BLE001
+                    fail += 1
+                    attempt_fail += 1
+                    await log(card("⚠️ SEND ERROR", [
+                        f"📱 Phone : {phone}",
+                        f"🎯 To : {guid}",
+                        f"💥 Error : {repr(e)[:200]}",
+                    ]))
+                    if attempt_fail >= config.MAX_ERRORS:
+                        hit_max = True
+                        break
+                await asyncio.sleep(delay)
+
+            if reason:                       # manual stop
+                break
+            if not hit_max:                  # whole list finished
+                break
+            if retry_count >= config.RESUME_MAX_RETRIES:
+                reason = f"رسیدن به سقف خطا ({config.MAX_ERRORS})"
+                break
+
+            # ---- auto-resume: wait, then continue from the rest of the list ----
+            retry_count += 1
+            remaining = max(0, total - ok - fail)
+            await log(card(f"🚨 ALERT 5 MINUTE {_alert_word(retry_count)}", [
+                f"✅ {ok}",
+                f"⏳ {remaining}",
+                f"👤 Account : {phone}",
+            ]))
+            if await _wait_or_stop(account_id, config.RESUME_WAIT):
                 reason = "توقف دستی توسط کاربر"
                 break
             try:
-                await asyncio.wait_for(
-                    rb.forward_message(client, saved_guid, guid, mid),
-                    timeout=config.SEND_TIMEOUT,
-                )
-                ok += 1
-            except Exception as e:  # noqa: BLE001
-                fail += 1
-                await log(card("⚠️ SEND ERROR", [
-                    f"📱 Phone : {phone}",
-                    f"🎯 To : {guid}",
-                    f"💥 Error : {repr(e)[:200]}",
-                ]))
-                if fail >= config.MAX_ERRORS:
-                    reason = f"رسیدن به سقف خطا ({config.MAX_ERRORS})"
-                    break
-            await asyncio.sleep(delay)
+                await client.disconnect()
+            except Exception:
+                pass
+            client = rb.open_client(phone)
+            await rb.connect_ready(client)
     except Exception as e:  # noqa: BLE001
         reason = f"خطای کلی: {repr(e)[:200]}"
     finally:
@@ -752,6 +837,7 @@ async def run_send(owner_id: int, payload: dict):
             await client.disconnect()
         except Exception:
             pass
+        active_jobs.discard(account_id)
 
     dur = str(datetime.now() - started).split(".")[0]
     pending_send.pop(owner_id, None)
@@ -797,6 +883,9 @@ async def channel_start_cb(event):
     acc = db.get_account(account_id)
     if not acc:
         await event.answer("اکانت پیدا نشد.", alert=True)
+        return
+    if automation_on(account_id):
+        await event.answer("🔁 اتومیشن این اکانت روشنه. اول خاموشش کن.", alert=True)
         return
     state[event.sender_id] = {"step": "await_channel_name", "account_id": account_id}
     await safe_edit(event, 
@@ -1493,6 +1582,11 @@ async def wk_del_do_cb(event):
 # Remote send (account owned by a remote worker)
 # --------------------------------------------------------------------------- #
 async def send_prepare_remote(event, acc, w, marker):
+    if automation_on(acc["id"]):
+        await safe_edit(event,
+            "🔁 اتومیشن این اکانت روشنه. اول از بخش «🔁 اتومیشن» خاموشش کن، بعد ارسال بزن.",
+            buttons=[[Button.inline("🔙 بازگشت", f"acc_{acc['id']}".encode())]])
+        return
     await safe_edit(event, f"⏳ بررسی ورکر {w['tag']} و آماده‌سازی ...")
     # CHECK the worker right before using it.
     try:
@@ -1559,6 +1653,7 @@ async def run_send_remote(owner_id: int, payload: dict):
         pending_send.pop(owner_id, None)
         return
 
+    active_jobs.add(account_id)
     await log(card("SEND STARTED 🚀", [
         f"🛠 Count : {count:03d}",
         f"📱 Phone : {phone}",
@@ -1570,10 +1665,12 @@ async def run_send_remote(owner_id: int, payload: dict):
         f"📌 Marker : «{marker}» Found ✅",
     ]))
 
+    prev_retry = 0
     try:
         res = await worker.api_call(w, "POST", "/send/start", {
             "phone": phone, "marker": marker, "delay": delay,
             "max_errors": config.MAX_ERRORS, "send_timeout": config.SEND_TIMEOUT,
+            "resume_wait": config.RESUME_WAIT, "max_retries": config.RESUME_MAX_RETRIES,
         })
         if not res.get("ok") or not res.get("marker_found"):
             reason = "مارکر روی ورکر پیدا نشد"
@@ -1594,6 +1691,16 @@ async def run_send_remote(owner_id: int, payload: dict):
                     break
                 ok = stt.get("ok", 0)
                 fail = stt.get("fail", 0)
+                # auto-resume happening on the worker -> master posts the ALERT
+                rc = stt.get("retry_count", 0)
+                if rc > prev_retry:
+                    prev_retry = rc
+                    remaining = max(0, total - ok - fail)
+                    await log(card(f"🚨 ALERT 5 MINUTE {_alert_word(rc)}", [
+                        f"✅ {ok}",
+                        f"⏳ {remaining}",
+                        f"👤 Account : {phone}",
+                    ]))
                 if stt.get("done"):
                     r = stt.get("reason")
                     if r == "manual_stop":
@@ -1610,6 +1717,7 @@ async def run_send_remote(owner_id: int, payload: dict):
         db.incr_worker_sent(w["id"], ok)
     except Exception:
         pass
+    active_jobs.discard(account_id)
     dur = str(datetime.now() - started).split(".")[0]
     pending_send.pop(owner_id, None)
     is_owner_user = owner_id == config.OWNER_ID
@@ -1642,6 +1750,282 @@ async def run_send_remote(owner_id: int, payload: dict):
                                    buttons=main_menu(is_owner_user))
         except Exception:
             pass
+
+
+# --------------------------------------------------------------------------- #
+# Automation: rotate texts to an account's groups, repeatedly.
+# Works for local (master) accounts and accounts owned by a remote worker.
+# --------------------------------------------------------------------------- #
+@bot.on(events.CallbackQuery(data=b"automation"))
+async def automation_menu_cb(event):
+    if not is_owner(event):
+        return
+    state.pop(event.sender_id, None)
+    accounts = db.list_accounts()
+    if not accounts:
+        await safe_edit(event, "اول یک اکانت اضافه کن.",
+                        buttons=[[Button.inline("➕ افزودن اکانت", b"add_account")],
+                                 [Button.inline("🔙 بازگشت", b"home")]])
+        return
+    rows = []
+    for a in accounts:
+        on = automation_on(a["id"])
+        rows.append([Button.inline(f"{'🟢' if on else '⚪️'} {a['phone']}",
+                                   f"auto_{a['id']}".encode())])
+    rows.append([Button.inline("🔙 بازگشت", b"home")])
+    await safe_edit(event, "🔁 اتومیشن — یک اکانت انتخاب کن:", buttons=rows)
+
+
+@bot.on(events.CallbackQuery(pattern=b"auto_(\\d+)"))
+async def automation_account_cb(event):
+    if not is_owner(event):
+        return
+    state.pop(event.sender_id, None)
+    account_id = int(event.pattern_match.group(1))
+    acc = db.get_account(account_id)
+    if not acc:
+        await event.answer("اکانت پیدا نشد.", alert=True)
+        return
+    au = db.get_automation(account_id)
+    texts = db.list_automation_texts(account_id)
+    on = bool(au["enabled"])
+    lines = [
+        f"🔁 اتومیشن — {acc['phone']}", LINE,
+        f"وضعیت : {'🟢 روشن' if on else '⚪️ خاموش'}",
+        f"فاصله : {au['interval_sec']} ثانیه",
+        f"تعداد متن‌ها : {len(texts)}",
+        f"مجموع ارسال : {au['sent_total']}",
+    ]
+    rows = [
+        [Button.inline("➕ افزودن متن", f"auadd_{account_id}".encode()),
+         Button.inline("🗑 پاک‌کردن متن‌ها", f"auclr_{account_id}".encode())],
+        [Button.inline("⏱ تنظیم فاصله", f"auint_{account_id}".encode())],
+        [Button.inline("⏹ خاموش‌کردن" if on else "▶️ روشن‌کردن",
+                       f"autog_{account_id}".encode())],
+        [Button.inline("🔙 بازگشت", b"automation")],
+    ]
+    await safe_edit(event, "\n".join(lines), buttons=rows)
+
+
+@bot.on(events.CallbackQuery(pattern=b"auadd_(\\d+)"))
+async def automation_add_text_cb(event):
+    if not is_owner(event):
+        return
+    account_id = int(event.pattern_match.group(1))
+    state[event.sender_id] = {"step": "await_auto_text", "account_id": account_id}
+    await safe_edit(event, "✍️ متنی که می‌خوای به گروه‌ها بره رو بفرست (می‌تونی چند تا پشت‌هم بفرستی):",
+                    buttons=[[Button.inline("✅ تمام / بازگشت", f"auto_{account_id}".encode())]])
+
+
+async def handle_auto_text(event):
+    st = state.get(event.sender_id)
+    if not st:
+        return
+    account_id = st.get("account_id")
+    text = event.raw_text.strip()
+    if not text:
+        await event.respond("متن خالیه. دوباره بفرست.")
+        return
+    db.add_automation_text(account_id, text)
+    n = len(db.list_automation_texts(account_id))
+    await event.respond(
+        f"✅ متن اضافه شد (مجموع: {n}). متن بعدی رو بفرست یا برگرد.",
+        buttons=[[Button.inline("✅ تمام / بازگشت", f"auto_{account_id}".encode())]])
+
+
+@bot.on(events.CallbackQuery(pattern=b"auclr_(\\d+)"))
+async def automation_clear_cb(event):
+    if not is_owner(event):
+        return
+    account_id = int(event.pattern_match.group(1))
+    db.clear_automation_texts(account_id)
+    await event.answer("همه‌ی متن‌ها پاک شد.")
+    await automation_account_cb(event)
+
+
+@bot.on(events.CallbackQuery(pattern=b"auint_(\\d+)"))
+async def automation_interval_cb(event):
+    if not is_owner(event):
+        return
+    account_id = int(event.pattern_match.group(1))
+    state[event.sender_id] = {"step": "await_auto_interval", "account_id": account_id}
+    await safe_edit(event,
+        f"⏱ یک عدد بین {config.AUTOMATION_MIN_INTERVAL} تا {config.AUTOMATION_MAX_INTERVAL} "
+        "بفرست (فاصله‌ی هر دور به ثانیه):",
+        buttons=[[Button.inline("🔙 بازگشت", f"auto_{account_id}".encode())]])
+
+
+async def handle_auto_interval(event):
+    st = state.get(event.sender_id)
+    if not st:
+        return
+    account_id = st.get("account_id")
+    db.set_automation_interval(account_id, event.raw_text.strip())
+    iv = db.get_automation(account_id)["interval_sec"]
+    state.pop(event.sender_id, None)
+    acc = db.get_account(account_id)
+    if acc and automation_on(account_id):   # apply new interval to a live loop
+        await stop_automation(acc)
+        await start_automation(acc)
+    await event.respond(f"✅ فاصله روی {iv} ثانیه تنظیم شد.",
+                        buttons=[[Button.inline("🔙 بازگشت", f"auto_{account_id}".encode())]])
+
+
+@bot.on(events.CallbackQuery(pattern=b"autog_(\\d+)"))
+async def automation_toggle_cb(event):
+    if not is_owner(event):
+        return
+    account_id = int(event.pattern_match.group(1))
+    acc = db.get_account(account_id)
+    if not acc:
+        await event.answer("اکانت پیدا نشد.", alert=True)
+        return
+    au = db.get_automation(account_id)
+    if not au["enabled"]:                       # turning ON
+        if not db.list_automation_texts(account_id):
+            await event.answer("اول حداقل یک متن اضافه کن.", alert=True)
+            return
+        if account_id in active_jobs:
+            await event.answer("این اکانت الان در حال ارساله. صبر کن تموم شه.", alert=True)
+            return
+        db.set_automation_enabled(account_id, True)
+        await start_automation(acc)
+        await log(card("🔁 AUTOMATION ON", [
+            f"👤 Account : {acc['phone']}",
+            f"⏱ Interval : {au['interval_sec']}s",
+            f"🕒 {now()}",
+        ]))
+    else:                                       # turning OFF
+        db.set_automation_enabled(account_id, False)
+        await stop_automation(acc)
+        await log(card("🔁 AUTOMATION OFF", [
+            f"👤 Account : {acc['phone']}",
+            f"🕒 {now()}",
+        ]))
+    await automation_account_cb(event)
+
+
+async def run_automation_local(account_id: int, phone: str, st: dict):
+    """Local automation loop: every interval send a random text to each group
+    (with a tiny random pause between groups). Skips groups that error."""
+    client = rb.open_client(phone)
+    last_text: dict = {}
+    try:
+        await rb.connect_ready(client)
+        while not st["stop"]:
+            try:
+                groups = await rb.get_group_guids(client)
+            except Exception:
+                groups = []
+            st["groups"] = len(groups)
+            for g in groups:
+                if st["stop"]:
+                    break
+                guid = g["guid"]
+                if guid in st["skipped"]:
+                    continue
+                idx, txt = _pick_text(st["texts"], last_text.get(guid))
+                if txt is None:
+                    break
+                try:
+                    await rb.send_text(client, guid, txt)
+                    st["sent"] += 1
+                    db.incr_automation_sent(account_id, 1)
+                    last_text[guid] = idx
+                except Exception:
+                    st["skipped"].add(guid)     # mute a failing group
+                await asyncio.sleep(random.uniform(
+                    config.AUTOMATION_GROUP_DELAY_MIN,
+                    config.AUTOMATION_GROUP_DELAY_MAX))
+            waited = 0
+            while waited < st["interval"] and not st["stop"]:
+                await asyncio.sleep(1)
+                waited += 1
+    except Exception as e:  # noqa: BLE001
+        await log(f"⚠️ اتومیشن «{phone}» با خطا متوقف شد: {repr(e)[:150]}")
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+
+async def start_automation(acc: dict):
+    """Start the automation loop for an account (local task or remote worker job)."""
+    account_id = acc["id"]
+    texts = db.list_automation_texts(account_id)
+    interval = db.get_automation(account_id)["interval_sec"]
+    w = worker.worker_for_account(acc)
+    if w and not worker.is_local(w):
+        await worker.api_call(w, "POST", "/automation/start",
+                              {"phone": acc["phone"], "texts": texts, "interval": interval})
+        return
+    # local
+    old = automation_tasks.pop(account_id, None)
+    if old:
+        old["state"]["stop"] = True
+    st = {"stop": False, "sent": 0, "groups": 0, "skipped": set(),
+          "texts": texts, "interval": interval}
+    task = asyncio.create_task(run_automation_local(account_id, acc["phone"], st))
+    automation_tasks[account_id] = {"task": task, "state": st}
+
+
+async def stop_automation(acc: dict):
+    account_id = acc["id"]
+    w = worker.worker_for_account(acc)
+    if w and not worker.is_local(w):
+        try:
+            await worker.api_call(w, "POST", "/automation/stop", {"phone": acc["phone"]})
+        except Exception:
+            pass
+        return
+    t = automation_tasks.pop(account_id, None)
+    if t:
+        t["state"]["stop"] = True
+
+
+async def automation_summary_loop():
+    """Every AUTOMATION_SUMMARY_INTERVAL, post a per-account total. Also re-heals
+    remote automations whose worker container restarted (loop got wiped)."""
+    while True:
+        await asyncio.sleep(config.AUTOMATION_SUMMARY_INTERVAL)
+        try:
+            for au in db.list_enabled_automations():
+                acc = db.get_account(au["account_id"])
+                if not acc:
+                    continue
+                w = worker.worker_for_account(acc)
+                sent = au["sent_total"]
+                groups = None
+                if w and not worker.is_local(w):
+                    try:
+                        stt = await worker.api_call(
+                            w, "GET", f"/automation/status?phone={acc['phone']}")
+                        if not stt.get("running"):   # worker restarted -> relaunch
+                            await start_automation(acc)
+                        sent = stt.get("sent", sent)
+                        groups = stt.get("groups")
+                    except Exception:
+                        pass
+                rows = [f"👤 Account : {acc['phone']}", f"✅ مجموع ارسال : {sent}"]
+                if groups is not None:
+                    rows.append(f"👥 گروه‌ها : {groups}")
+                rows.append(f"🕒 {now()}")
+                await log(card("🔁 AUTOMATION SUMMARY", rows))
+        except Exception as e:  # noqa: BLE001
+            print(f"[automation_summary] {e}")
+
+
+async def recover_automations():
+    """On boot, relaunch every automation that was enabled before restart."""
+    for au in db.list_enabled_automations():
+        acc = db.get_account(au["account_id"])
+        if not acc:
+            continue
+        try:
+            await start_automation(acc)
+        except Exception as e:  # noqa: BLE001
+            await log(f"⚠️ بازگردانی اتومیشن {acc['phone']} ناموفق: {repr(e)[:120]}")
 
 
 # --------------------------------------------------------------------------- #
@@ -1691,6 +2075,9 @@ async def amain():
     print(f"Panel is running (version {config.VERSION}).")
     # background worker health monitor (alerts + periodic STATU WORKER ALL)
     asyncio.create_task(health_loop())
+    # automation: periodic summary log + relaunch any automation enabled before restart
+    asyncio.create_task(automation_summary_loop())
+    await recover_automations()
     try:
         await bot.run_until_disconnected()
     finally:

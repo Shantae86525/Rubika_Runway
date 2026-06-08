@@ -52,6 +52,22 @@ CHANNEL_ADD_BATCH = _int("CHANNEL_ADD_BATCH", 80)
 # Pause (seconds) between member-add batches to stay gentle on Rubika.
 CHANNEL_ADD_DELAY = _float("CHANNEL_ADD_DELAY", 2.0)
 
+# ---- Auto-resume (continue a send after an error/crash) ----
+# When a send stops because of errors (NOT a manual stop), wait this many
+# seconds and resume from the rest of the list, up to RESUME_MAX_RETRIES times.
+RESUME_WAIT = _int("RESUME_WAIT", 300)            # 5 minutes
+RESUME_MAX_RETRIES = _int("RESUME_MAX_RETRIES", 2)
+
+# ---- Automation (rotating texts to the account's own groups) ----
+# Every interval (clamped to [MIN,MAX]) the bot sends a random text to each of
+# the account's groups. A tiny random pause between groups avoids a spam burst.
+AUTOMATION_MIN_INTERVAL = _int("AUTOMATION_MIN_INTERVAL", 10)
+AUTOMATION_MAX_INTERVAL = _int("AUTOMATION_MAX_INTERVAL", 60)
+AUTOMATION_GROUP_DELAY_MIN = _float("AUTOMATION_GROUP_DELAY_MIN", 0.5)
+AUTOMATION_GROUP_DELAY_MAX = _float("AUTOMATION_GROUP_DELAY_MAX", 2.0)
+# How often (seconds) the master posts the per-account automation summary.
+AUTOMATION_SUMMARY_INTERVAL = _int("AUTOMATION_SUMMARY_INTERVAL", 1200)  # 20 min
+
 # Version label shown in the startup "Online" log card.
 VERSION = os.getenv("VERSION", "V1")
 
@@ -121,6 +137,15 @@ def clamp_delay(value) -> float:
     except (TypeError, ValueError):
         return DEFAULT_DELAY
     return max(MIN_DELAY, min(MAX_DELAY, value))
+
+
+def clamp_interval(value) -> int:
+    """Keep the automation interval inside [AUTOMATION_MIN_INTERVAL, MAX]."""
+    try:
+        value = int(float(value))
+    except (TypeError, ValueError):
+        return AUTOMATION_MIN_INTERVAL
+    return max(AUTOMATION_MIN_INTERVAL, min(AUTOMATION_MAX_INTERVAL, value))
 
 
 def validate() -> list:
