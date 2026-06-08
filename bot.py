@@ -177,9 +177,7 @@ def main_menu(owner: bool = True):
 
 
 WELCOME = (
-    "╭───────────────────╮\n"
-    "     🤖  پنل روبیکا\n"
-    "╰───────────────────╯\n"
+    "🤖 روبیکا تولز\n"
     "خوش اومدی 👋 یکی از گزینه‌ها رو انتخاب کن:"
 )
 
@@ -1914,16 +1912,27 @@ async def automation_toggle_cb(event):
 
 async def run_automation_local(account_id: int, phone: str, st: dict):
     """Local automation loop: every interval send a random text to each group
-    (with a tiny random pause between groups). Skips groups that error."""
-    client = rb.open_client(phone)
+    (tiny random pause between groups). A group is muted only after 3 failures
+    in a row; if everything gets muted (e.g. a temporary block) we reset and
+    reconnect so the loop can recover instead of going silent. Every network
+    call has a timeout so a single stuck call can't freeze the whole loop."""
+    fails: dict = {}          # guid -> consecutive failures
     last_text: dict = {}
+    client = None
     try:
-        await rb.connect_ready(client)
         while not st["stop"]:
+            if client is None:
+                client = rb.open_client(phone)
+                await rb.connect_ready(client)
             try:
-                groups = await rb.get_group_guids(client)
+                groups = await asyncio.wait_for(rb.get_group_guids(client), timeout=60)
             except Exception:
                 groups = []
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                client = None
             st["groups"] = len(groups)
             for g in groups:
                 if st["stop"]:
@@ -1935,15 +1944,29 @@ async def run_automation_local(account_id: int, phone: str, st: dict):
                 if txt is None:
                     break
                 try:
-                    await rb.send_text(client, guid, txt)
+                    await asyncio.wait_for(
+                        rb.send_text(client, guid, txt), timeout=config.SEND_TIMEOUT)
                     st["sent"] += 1
                     db.incr_automation_sent(account_id, 1)
                     last_text[guid] = idx
+                    fails[guid] = 0
                 except Exception:
-                    st["skipped"].add(guid)     # mute a failing group
+                    fails[guid] = fails.get(guid, 0) + 1
+                    if fails[guid] >= 3:
+                        st["skipped"].add(guid)   # mute after repeated failures
                 await asyncio.sleep(random.uniform(
                     config.AUTOMATION_GROUP_DELAY_MIN,
                     config.AUTOMATION_GROUP_DELAY_MAX))
+            # recovery: if every group ended up muted, reset + reconnect
+            if groups and all(g["guid"] in st["skipped"] for g in groups):
+                st["skipped"].clear()
+                fails.clear()
+                try:
+                    if client:
+                        await client.disconnect()
+                except Exception:
+                    pass
+                client = None
             waited = 0
             while waited < st["interval"] and not st["stop"]:
                 await asyncio.sleep(1)
@@ -1952,7 +1975,8 @@ async def run_automation_local(account_id: int, phone: str, st: dict):
         await log(f"⚠️ اتومیشن «{phone}» با خطا متوقف شد: {repr(e)[:150]}")
     finally:
         try:
-            await client.disconnect()
+            if client:
+                await client.disconnect()
         except Exception:
             pass
 

@@ -324,17 +324,26 @@ def _pick_text(texts: list, last_idx):
 
 
 async def _run_automation(phone: str, state: dict):
-    """Worker-side automation loop: every interval, send a random text to each
-    group (with a tiny random pause between groups). Skips groups that error."""
-    client = rb.open_client(phone)
+    """Worker-side automation loop. A group is muted only after 3 failures in a
+    row; if everything gets muted we reset + reconnect to recover. Every network
+    call is wrapped in a timeout so a single stuck call can't freeze the loop."""
+    fails: dict = {}
     last_text: dict = {}
+    client = None
     try:
-        await rb.connect_ready(client)
         while not state["stop"]:
+            if client is None:
+                client = rb.open_client(phone)
+                await rb.connect_ready(client)
             try:
-                groups = await rb.get_group_guids(client)
+                groups = await asyncio.wait_for(rb.get_group_guids(client), timeout=60)
             except Exception:
                 groups = []
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                client = None
             state["groups"] = len(groups)
             for g in groups:
                 if state["stop"]:
@@ -346,14 +355,27 @@ async def _run_automation(phone: str, state: dict):
                 if txt is None:
                     break
                 try:
-                    await rb.send_text(client, guid, txt)
+                    await asyncio.wait_for(
+                        rb.send_text(client, guid, txt), timeout=config.SEND_TIMEOUT)
                     state["sent"] += 1
                     last_text[guid] = idx
+                    fails[guid] = 0
                 except Exception:
-                    state["skipped"].add(guid)  # mute a failing group
+                    fails[guid] = fails.get(guid, 0) + 1
+                    if fails[guid] >= 3:
+                        state["skipped"].add(guid)
                 await asyncio.sleep(random.uniform(
                     config.AUTOMATION_GROUP_DELAY_MIN,
                     config.AUTOMATION_GROUP_DELAY_MAX))
+            if groups and all(g["guid"] in state["skipped"] for g in groups):
+                state["skipped"].clear()
+                fails.clear()
+                try:
+                    if client:
+                        await client.disconnect()
+                except Exception:
+                    pass
+                client = None
             waited = 0
             while waited < state["interval"] and not state["stop"]:
                 await asyncio.sleep(1)
@@ -362,7 +384,8 @@ async def _run_automation(phone: str, state: dict):
         pass
     finally:
         try:
-            await client.disconnect()
+            if client:
+                await client.disconnect()
         except Exception:
             pass
 
