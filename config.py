@@ -71,6 +71,60 @@ AUTOMATION_SUMMARY_INTERVAL = _int("AUTOMATION_SUMMARY_INTERVAL", 1200)  # 20 mi
 # Pause (seconds) between joining each personal group from the link list.
 GROUP_JOIN_DELAY = _float("GROUP_JOIN_DELAY", 3.0)
 
+# --------------------------------------------------------------------------- #
+# Automation EXTRAS (additive — Feature set: secretary / channel report /
+# profile sync / reply responder / shared connection). All optional with sane
+# defaults; nothing here changes existing behaviour.
+# --------------------------------------------------------------------------- #
+# Feature 6: close an account's warm connection after this many idle seconds.
+CONN_IDLE_CLOSE_SEC = _int("CONN_IDLE_CLOSE_SEC", 600)        # 10 min
+
+# Feature 1 (PV secretary): how often to poll for new private chats, and bounds.
+SECRETARY_INTERVAL = _int("SECRETARY_INTERVAL", 600)         # 10 min default
+SECRETARY_MIN_INTERVAL = _int("SECRETARY_MIN_INTERVAL", 60)
+SECRETARY_MAX_INTERVAL = _int("SECRETARY_MAX_INTERVAL", 3600)
+# Pause between individual auto-replies in one secretary pass.
+SECRETARY_REPLY_DELAY = _float("SECRETARY_REPLY_DELAY", 2.0)
+
+# Feature 2 (channel report): how often to post the channel stats, and bounds.
+CHANNEL_REPORT_INTERVAL = _int("CHANNEL_REPORT_INTERVAL", 600)   # 10 min
+CHANNEL_REPORT_MIN_INTERVAL = _int("CHANNEL_REPORT_MIN_INTERVAL", 120)
+CHANNEL_REPORT_MAX_INTERVAL = _int("CHANNEL_REPORT_MAX_INTERVAL", 3600)
+
+# Feature 3 (profile sync): pause between applying the profile to each account.
+PROFILE_SYNC_DELAY = _float("PROFILE_SYNC_DELAY", 1.0)
+
+# Feature 5 (group-reply responder): default + bounds for the reply delay, and
+# how often the responder polls the account's chats for new replies.
+REPLY_DELAY = _float("REPLY_DELAY", 2.0)
+REPLY_MIN_DELAY = _float("REPLY_MIN_DELAY", 0.0)
+REPLY_MAX_DELAY = _float("REPLY_MAX_DELAY", 60.0)
+REPLY_POLL_INTERVAL = _int("REPLY_POLL_INTERVAL", 20)        # seconds between polls
+
+
+def clamp_secretary_interval(value) -> int:
+    try:
+        value = int(float(value))
+    except (TypeError, ValueError):
+        return SECRETARY_INTERVAL
+    return max(SECRETARY_MIN_INTERVAL, min(SECRETARY_MAX_INTERVAL, value))
+
+
+def clamp_channel_report_interval(value) -> int:
+    try:
+        value = int(float(value))
+    except (TypeError, ValueError):
+        return CHANNEL_REPORT_INTERVAL
+    return max(CHANNEL_REPORT_MIN_INTERVAL, min(CHANNEL_REPORT_MAX_INTERVAL, value))
+
+
+def clamp_reply_delay(value) -> float:
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return REPLY_DELAY
+    return max(REPLY_MIN_DELAY, min(REPLY_MAX_DELAY, value))
+
 # Version label shown in the startup "Online" log card.
 VERSION = os.getenv("VERSION", "V1")
 

@@ -23,6 +23,7 @@ import asyncio
 import random
 import uuid
 
+import account_conn
 import config
 import rubika_client as rb
 
@@ -46,6 +47,47 @@ except ImportError:  # pragma: no cover
 _login_ctx: dict = {}   # phone -> rubpy login context dict
 _jobs: dict = {}        # job_id -> job state dict
 _automations: dict = {}  # phone -> automation state dict
+_secretaries: dict = {}  # phone -> secretary state dict
+_channelreports: dict = {}  # phone -> channel-report state dict
+_replies: dict = {}     # phone -> reply-responder state dict
+_extras_logs: list = []  # queued log-card strings; drained by the master
+
+LINE = "━━━━━━━━━━━━━━━━"
+
+
+def _now() -> str:
+    return config.now_str()
+
+
+def _wcard(title: str, rows: list) -> str:
+    rows = [r for r in rows if r is not None]
+    return f"{title}\n{LINE}\n" + "\n".join(rows)
+
+
+def _qlog(text: str):
+    """Queue a log card for the master to drain via GET /extras/logs."""
+    _extras_logs.append(text)
+    if len(_extras_logs) > 500:           # keep the queue bounded
+        del _extras_logs[:len(_extras_logs) - 500]
+
+
+async def _worker_on_invalid(phone: str):
+    _qlog(_wcard("🔐 INVALID_AUTH", [
+        f"👤 Account : {phone}",
+        "سشن این اکانت باطل شده — باید دوباره لاگین شه (باگ نیست).",
+        f"🕒 {_now()}"]))
+
+
+async def _apply_profile(client, first, last, bio):
+    """Update name/bio only if different from current. Returns True if changed."""
+    cur = await rb.get_my_profile(client)
+    same = ((cur.get("first_name") or "") == first
+            and (cur.get("last_name") or "") == last
+            and (cur.get("bio") or "") == bio)
+    if same:
+        return False
+    await rb.update_profile(client, first_name=first, last_name=last, bio=bio)
+    return True
 
 
 def _build_app():
@@ -104,6 +146,35 @@ def _build_app():
         target: int = 300
         batch: int = 80
         delay: float = 2.0
+
+    class SecretaryIn(BaseModel):
+        phone: str
+        mode: str = "marker"
+        text: str = ""
+        marker: str = ""
+        interval: int = 600
+
+    class ChannelReportIn(BaseModel):
+        phone: str
+        channel_guid: str = ""
+        channel_title: str = ""
+        interval: int = 600
+
+    class ReplyIn(BaseModel):
+        phone: str
+        text: str = ""
+        delay: float = 2.0
+
+    class ProfileIn(BaseModel):
+        phone: str
+        first_name: str = ""
+        last_name: str = ""
+        bio: str = ""
+
+    @app.on_event("startup")
+    async def _startup():
+        account_conn.set_invalid_auth_handler(_worker_on_invalid)
+        account_conn.start_janitor()
 
     # ----- ping (NO token; just proves the API process is alive) -----
     @app.get("/ping")
@@ -174,6 +245,7 @@ def _build_app():
     @app.post("/prepare")
     async def prepare(body: PrepareIn, authorization: str = Header(None)):
         _auth(authorization)
+        await account_conn.close(body.phone)   # ensure single connection (Feature 6)
         client = rb.open_client(body.phone)
         try:
             await rb.connect_ready(client)
@@ -192,6 +264,7 @@ def _build_app():
     @app.post("/channel/create")
     async def channel_create(body: ChannelCreateIn, authorization: str = Header(None)):
         _auth(authorization)
+        await account_conn.close(body.phone)   # ensure single connection (Feature 6)
         client = rb.open_client(body.phone)
         try:
             await rb.connect_ready(client)
@@ -215,6 +288,7 @@ def _build_app():
     @app.post("/channel/add")
     async def channel_add(body: ChannelAddIn, authorization: str = Header(None)):
         _auth(authorization)
+        await account_conn.close(body.phone)   # ensure single connection (Feature 6)
         client = rb.open_client(body.phone)
         try:
             await rb.connect_ready(client)
@@ -231,6 +305,7 @@ def _build_app():
     @app.post("/send/start")
     async def send_start(body: SendIn, authorization: str = Header(None)):
         _auth(authorization)
+        await account_conn.close(body.phone)   # ensure single connection (Feature 6)
         client = rb.open_client(body.phone)
         await rb.connect_ready(client)
         saved_guid, mid = await rb.find_marked_message(client, body.marker)
@@ -301,24 +376,121 @@ def _build_app():
     @app.post("/group/join")
     async def group_join(body: GroupJoinIn, authorization: str = Header(None)):
         _auth(authorization)
+        await account_conn.close(body.phone)   # ensure single connection (Feature 6)
         client = rb.open_client(body.phone)
         joined = 0
         failed = 0
+        joined_links = []
         try:
             await rb.connect_ready(client)
             for link in (body.links or []):
                 try:
                     await asyncio.wait_for(rb.join_group_by_link(client, link), timeout=60)
                     joined += 1
+                    joined_links.append(link)
                 except Exception:
                     failed += 1
                 await asyncio.sleep(config.GROUP_JOIN_DELAY)
-            return {"ok": True, "joined": joined, "failed": failed}
+            return {"ok": True, "joined": joined, "failed": failed,
+                    "joined_links": joined_links}
         finally:
             try:
                 await client.disconnect()
             except Exception:
                 pass
+
+    # ----- automation EXTRAS: secretary / channel report / reply / profile ----
+    @app.post("/secretary/start")
+    async def secretary_start(body: SecretaryIn, authorization: str = Header(None)):
+        _auth(authorization)
+        await _stop_secretary(body.phone)
+        st = {"stop": False, "mode": body.mode or "marker", "text": body.text or "",
+              "marker": body.marker or "", "primed": False, "state": "",
+              "replied_users": set(), "self_guid": None, "sent": 0, "task": None,
+              "interval": config.clamp_secretary_interval(body.interval)}
+        st["task"] = asyncio.create_task(_run_secretary(body.phone, st))
+        _secretaries[rb.normalize_phone(body.phone)] = st
+        return {"ok": True}
+
+    @app.post("/secretary/stop")
+    async def secretary_stop(body: SecretaryIn, authorization: str = Header(None)):
+        _auth(authorization)
+        await _stop_secretary(body.phone)
+        return {"ok": True}
+
+    @app.get("/secretary/status")
+    async def secretary_status(phone: str, authorization: str = Header(None)):
+        _auth(authorization)
+        st = _secretaries.get(rb.normalize_phone(phone))
+        if not st:
+            return {"running": False, "sent": 0}
+        return {"running": not st["stop"], "sent": st["sent"]}
+
+    @app.post("/channelreport/start")
+    async def channelreport_start(body: ChannelReportIn, authorization: str = Header(None)):
+        _auth(authorization)
+        await _stop_channelreport(body.phone)
+        st = {"stop": False, "channel_guid": body.channel_guid or "",
+              "channel_title": body.channel_title or "", "task": None,
+              "interval": config.clamp_channel_report_interval(body.interval)}
+        st["task"] = asyncio.create_task(_run_channelreport(body.phone, st))
+        _channelreports[rb.normalize_phone(body.phone)] = st
+        return {"ok": True}
+
+    @app.post("/channelreport/stop")
+    async def channelreport_stop(body: ChannelReportIn, authorization: str = Header(None)):
+        _auth(authorization)
+        await _stop_channelreport(body.phone)
+        return {"ok": True}
+
+    @app.get("/channelreport/status")
+    async def channelreport_status(phone: str, authorization: str = Header(None)):
+        _auth(authorization)
+        st = _channelreports.get(rb.normalize_phone(phone))
+        if not st:
+            return {"running": False}
+        return {"running": not st["stop"]}
+
+    @app.post("/reply/start")
+    async def reply_start(body: ReplyIn, authorization: str = Header(None)):
+        _auth(authorization)
+        await _stop_reply(body.phone)
+        st = {"stop": False, "text": body.text or "",
+              "delay": config.clamp_reply_delay(body.delay), "primed": False,
+              "state": "", "self_guid": None, "done": set(), "sent": 0, "task": None}
+        st["task"] = asyncio.create_task(_run_reply(body.phone, st))
+        _replies[rb.normalize_phone(body.phone)] = st
+        return {"ok": True}
+
+    @app.post("/reply/stop")
+    async def reply_stop(body: ReplyIn, authorization: str = Header(None)):
+        _auth(authorization)
+        await _stop_reply(body.phone)
+        return {"ok": True}
+
+    @app.get("/reply/status")
+    async def reply_status(phone: str, authorization: str = Header(None)):
+        _auth(authorization)
+        st = _replies.get(rb.normalize_phone(phone))
+        if not st:
+            return {"running": False, "sent": 0}
+        return {"running": not st["stop"], "sent": st["sent"]}
+
+    @app.post("/profile/update")
+    async def profile_update(body: ProfileIn, authorization: str = Header(None)):
+        _auth(authorization)
+        changed = await account_conn.call(body.phone, _apply_profile,
+                                          body.first_name, body.last_name, body.bio,
+                                          timeout=60)
+        return {"ok": True, "changed": bool(changed)}
+
+    @app.get("/extras/logs")
+    async def extras_logs(authorization: str = Header(None)):
+        _auth(authorization)
+        global _extras_logs
+        logs = _extras_logs
+        _extras_logs = []
+        return {"logs": logs}
 
     return app
 
@@ -350,26 +522,21 @@ def _pick_text(texts: list, last_idx):
 
 
 async def _run_automation(phone: str, state: dict):
-    """Worker-side automation loop. A group is muted only after 3 failures in a
-    row; if everything gets muted we reset + reconnect to recover. Every network
-    call is wrapped in a timeout so a single stuck call can't freeze the loop."""
+    """Worker-side automation loop — now on the SHARED connection (Feature 6).
+    A group is muted only after 3 failures in a row; if everything gets muted we
+    reset to recover. Every rubpy call goes through account_conn so the
+    worker-side secretary / reply / channel report on the same account interleave
+    safely instead of opening a second session."""
     fails: dict = {}
     last_text: dict = {}
-    client = None
     try:
         while not state["stop"]:
-            if client is None:
-                client = rb.open_client(phone)
-                await rb.connect_ready(client)
             try:
-                groups = await asyncio.wait_for(rb.get_group_guids(client), timeout=60)
+                groups = await account_conn.call(phone, rb.get_group_guids, timeout=60)
+            except account_conn.InvalidAuthError:
+                break
             except Exception:
                 groups = []
-                try:
-                    await client.disconnect()
-                except Exception:
-                    pass
-                client = None
             state["groups"] = len(groups)
             for g in groups:
                 if state["stop"]:
@@ -381,11 +548,14 @@ async def _run_automation(phone: str, state: dict):
                 if txt is None:
                     break
                 try:
-                    await asyncio.wait_for(
-                        rb.send_text(client, guid, txt), timeout=config.SEND_TIMEOUT)
+                    await account_conn.call(phone, rb.send_text, guid, txt,
+                                            timeout=config.SEND_TIMEOUT)
                     state["sent"] += 1
                     last_text[guid] = idx
                     fails[guid] = 0
+                except account_conn.InvalidAuthError:
+                    state["stop"] = True
+                    break
                 except Exception:
                     fails[guid] = fails.get(guid, 0) + 1
                     if fails[guid] >= 3:
@@ -396,24 +566,283 @@ async def _run_automation(phone: str, state: dict):
             if groups and all(g["guid"] in state["skipped"] for g in groups):
                 state["skipped"].clear()
                 fails.clear()
-                try:
-                    if client:
-                        await client.disconnect()
-                except Exception:
-                    pass
-                client = None
             waited = 0
             while waited < state["interval"] and not state["stop"]:
                 await asyncio.sleep(1)
                 waited += 1
     except Exception:
         pass
-    finally:
+
+
+async def _state_sleep(st: dict, seconds: float):
+    waited = 0.0
+    while waited < seconds and not st.get("stop"):
+        await asyncio.sleep(1.0)
+        waited += 1.0
+
+
+async def _stop_secretary(phone: str):
+    st = _secretaries.pop(rb.normalize_phone(phone), None)
+    if not st:
+        return
+    st["stop"] = True
+    t = st.get("task")
+    if t:
         try:
-            if client:
-                await client.disconnect()
+            await asyncio.wait_for(t, timeout=10)
         except Exception:
-            pass
+            t.cancel()
+
+
+async def _stop_channelreport(phone: str):
+    st = _channelreports.pop(rb.normalize_phone(phone), None)
+    if not st:
+        return
+    st["stop"] = True
+    t = st.get("task")
+    if t:
+        try:
+            await asyncio.wait_for(t, timeout=10)
+        except Exception:
+            t.cancel()
+
+
+async def _stop_reply(phone: str):
+    st = _replies.pop(rb.normalize_phone(phone), None)
+    if not st:
+        return
+    st["stop"] = True
+    t = st.get("task")
+    if t:
+        try:
+            await asyncio.wait_for(t, timeout=10)
+        except Exception:
+            t.cancel()
+
+
+async def _worker_self_guid(phone: str, st: dict):
+    if st.get("self_guid"):
+        return st["self_guid"]
+    try:
+        st["self_guid"] = await account_conn.call(phone, rb.get_self_guid, timeout=30)
+    except account_conn.InvalidAuthError:
+        raise
+    except Exception:
+        st["self_guid"] = None
+    return st.get("self_guid")
+
+
+async def _run_secretary(phone: str, st: dict):
+    """Worker-side PV secretary (in-memory tracking; logs queued for the master)."""
+    while not st["stop"]:
+        try:
+            try:
+                result = await account_conn.call(phone, rb.get_chats_updates,
+                                                 st.get("state") or "", timeout=60)
+            except account_conn.InvalidAuthError:
+                break
+            chats, new_state = rb.parse_chats_updates(result)
+            if new_state:
+                st["state"] = new_state
+            if not st["primed"]:
+                st["primed"] = True
+                await _state_sleep(st, st["interval"])
+                continue
+            try:
+                self_guid = await _worker_self_guid(phone, st)
+            except account_conn.InvalidAuthError:
+                break
+            marker_ctx = None
+            for chat in chats:
+                if st["stop"]:
+                    break
+                if rb.chat_type(chat) != "user":
+                    continue
+                guid = rb.chat_object_guid(chat)
+                if not guid:
+                    continue
+                author = rb.message_author_guid(rb.chat_last_message(chat))
+                if self_guid and author and author == self_guid:
+                    continue
+                if guid in st["replied_users"]:
+                    continue
+                try:
+                    if st["mode"] == "text":
+                        if not st["text"]:
+                            continue
+                        await account_conn.call(phone, rb.send_text, guid, st["text"],
+                                                timeout=config.SEND_TIMEOUT)
+                    else:
+                        if marker_ctx is None:
+                            marker_ctx = await account_conn.call(
+                                phone, rb.find_marked_message, st["marker"] or "",
+                                timeout=60)
+                        saved_guid, mid = marker_ctx
+                        if not mid:
+                            _qlog(_wcard("🤖 منشی — مارکر پیدا نشد", [
+                                f"👤 Account : {phone}", f"🕒 {_now()}"]))
+                            break
+                        await account_conn.call(phone, rb.forward_to, saved_guid,
+                                                guid, mid, timeout=config.SEND_TIMEOUT)
+                    st["replied_users"].add(guid)
+                    st["sent"] += 1
+                    _qlog(_wcard("🤖 منشی — جواب خودکار", [
+                        f"👤 Account : {phone}",
+                        f"🎯 To : {guid}",
+                        f"✍️ Mode : {'متن دلخواه' if st['mode'] == 'text' else 'مارکر'}",
+                        f"🕒 {_now()}"]))
+                except account_conn.InvalidAuthError:
+                    st["stop"] = True
+                    break
+                except Exception as e:  # noqa: BLE001
+                    _qlog(_wcard("⚠️ منشی — خطا", [
+                        f"👤 Account : {phone}", f"🎯 To : {guid}",
+                        f"💥 {repr(e)[:140]}", f"🕒 {_now()}"]))
+                await asyncio.sleep(config.SECRETARY_REPLY_DELAY)
+        except Exception as e:  # noqa: BLE001
+            _qlog(_wcard("⚠️ منشی — خطای حلقه", [
+                f"👤 Account : {phone}", f"💥 {repr(e)[:140]}", f"🕒 {_now()}"]))
+        await _state_sleep(st, st["interval"])
+
+
+async def _run_channelreport(phone: str, st: dict):
+    """Worker-side channel report; queues the report card for the master."""
+    while not st["stop"]:
+        guid = st.get("channel_guid") or ""
+        title = st.get("channel_title") or ""
+        iv = st["interval"]
+        if guid and not str(guid).startswith("c0"):
+            try:
+                rguid, rtitle = await account_conn.call(phone, rb.resolve_channel,
+                                                        guid, timeout=60)
+                if rguid:
+                    guid = rguid
+                    st["channel_guid"] = rguid
+                    if rtitle and not title:
+                        title = rtitle
+                        st["channel_title"] = rtitle
+            except account_conn.InvalidAuthError:
+                break
+            except Exception as e:  # noqa: BLE001
+                _qlog(_wcard("⚠️ گزارش کانال — خطا در resolve", [
+                    f"👤 Account : {phone}", f"📢 {guid}",
+                    f"💥 {repr(e)[:140]}", f"🕒 {_now()}"]))
+                await _state_sleep(st, iv)
+                continue
+        if guid:
+            try:
+                info = await account_conn.call(phone, rb.get_channel_info, guid,
+                                               timeout=60)
+                members = rb.channel_member_count(info)
+                if not title:
+                    title = rb.channel_title_of(info)
+                views, _mid = await account_conn.call(phone, rb.get_last_post_views,
+                                                      guid, timeout=60)
+                _qlog(_wcard("📊 گزارش کانال", [
+                    f"👤 Account : {phone}",
+                    f"🆔 Channel : {guid}",
+                    (f"🏷 Title : {title}" if title else None),
+                    f"👥 Members : {members}",
+                    f"👁 Last post views : "
+                    f"{views if views is not None else 'نامشخص'}",
+                    f"🕒 {_now()}"]))
+            except account_conn.InvalidAuthError:
+                break
+            except Exception as e:  # noqa: BLE001
+                _qlog(_wcard("⚠️ گزارش کانال — خطا", [
+                    f"👤 Account : {phone}", f"🆔 Channel : {guid}",
+                    f"💥 {repr(e)[:140]}", f"🕒 {_now()}"]))
+        await _state_sleep(st, iv)
+
+
+async def _run_reply(phone: str, st: dict):
+    """Worker-side group-reply responder; queues each reply card for the master."""
+    while not st["stop"]:
+        try:
+            text = st.get("text") or ""
+            delay = st.get("delay")
+            if delay is None:
+                delay = config.REPLY_DELAY
+            if not text:
+                await _state_sleep(st, config.REPLY_POLL_INTERVAL)
+                continue
+            try:
+                self_guid = await _worker_self_guid(phone, st)
+            except account_conn.InvalidAuthError:
+                break
+            try:
+                result = await account_conn.call(phone, rb.get_chats_updates,
+                                                 st.get("state") or "", timeout=60)
+            except account_conn.InvalidAuthError:
+                break
+            chats, new_state = rb.parse_chats_updates(result)
+            if new_state:
+                st["state"] = new_state
+            if not st["primed"]:
+                st["primed"] = True
+                await _state_sleep(st, config.REPLY_POLL_INTERVAL)
+                continue
+            done = st["done"]
+            for chat in chats:
+                if st["stop"]:
+                    break
+                if rb.chat_type(chat) != "group":
+                    continue
+                gguid = rb.chat_object_guid(chat)
+                if not gguid:
+                    continue
+                try:
+                    msgs = await account_conn.call(phone, rb.get_recent_messages,
+                                                   gguid, 20, timeout=60)
+                except account_conn.InvalidAuthError:
+                    st["stop"] = True
+                    break
+                except Exception:
+                    msgs = []
+                for m in msgs:
+                    if st["stop"]:
+                        break
+                    mid = rb._msg_id_of(m)
+                    rtid = rb.message_reply_to_id(m)
+                    if not mid or not rtid or mid in done:
+                        continue
+                    author = rb.message_author_guid(m)
+                    if self_guid and author == self_guid:
+                        done.add(mid)
+                        continue
+                    try:
+                        parents = await account_conn.call(
+                            phone, rb.get_messages_by_id, gguid, [rtid], timeout=60)
+                    except account_conn.InvalidAuthError:
+                        st["stop"] = True
+                        break
+                    except Exception:
+                        parents = []
+                    if not parents:
+                        continue
+                    if not (self_guid and rb.message_author_guid(parents[0]) == self_guid):
+                        done.add(mid)
+                        continue
+                    await asyncio.sleep(max(0.0, float(delay)))
+                    try:
+                        await account_conn.call(phone, rb.send_reply, gguid, text,
+                                                mid, timeout=config.SEND_TIMEOUT)
+                        done.add(mid)
+                        st["sent"] += 1
+                        _qlog(_wcard("↩️ پاسخ‌گوی ریپلای", [
+                            f"یک ریپلای جواب داده شد توسط [{phone}]",
+                            f"👥 Group : {gguid}", f"🕒 {_now()}"]))
+                    except account_conn.InvalidAuthError:
+                        st["stop"] = True
+                        break
+                    except Exception as e:  # noqa: BLE001
+                        _qlog(_wcard("⚠️ ریپلای — خطا", [
+                            f"👤 Account : {phone}", f"👥 Group : {gguid}",
+                            f"💥 {repr(e)[:140]}", f"🕒 {_now()}"]))
+        except Exception as e:  # noqa: BLE001
+            _qlog(_wcard("⚠️ ریپلای — خطای حلقه", [
+                f"👤 Account : {phone}", f"💥 {repr(e)[:140]}", f"🕒 {_now()}"]))
+        await _state_sleep(st, config.REPLY_POLL_INTERVAL)
 
 
 async def _sleep_with_stop(job: dict, seconds: float, step: float = 2.0):
