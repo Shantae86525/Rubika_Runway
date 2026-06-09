@@ -129,6 +129,23 @@ def extract_views(msg: dict):
     return None, None
 
 
+def find_keys(obj, needles, path=""):
+    """Recursively collect (path, value) for dict keys whose name contains any
+    of `needles` (case-insensitive) and whose value is a scalar."""
+    found = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            kp = f"{path}.{k}" if path else str(k)
+            if (any(n in str(k).lower() for n in needles)
+                    and not isinstance(v, (dict, list))):
+                found.append((kp, v))
+            found.extend(find_keys(v, needles, kp))
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            found.extend(find_keys(v, needles, f"{path}[{i}]"))
+    return found
+
+
 async def main():
     if len(sys.argv) < 3:
         print(__doc__)
@@ -161,7 +178,8 @@ async def main():
                 print("\n>>> MEMBER COUNT field NOT recognized — "
                       "look at the raw dump above and tell me the field name.")
 
-        # ---- get_messages(channel_guid, "0", limit) -> last post views ----
+        # ---- last post views -------------------------------------------------
+        VIEW_NEEDLES = ("view", "seen", "read")
         msgs = await client.get_messages(guid, "0", "5")
         messages = getattr(msgs, "messages", None)
         if messages is None and isinstance(msgs, dict):
@@ -169,16 +187,53 @@ async def main():
         if not messages:
             print("\n>>> no messages returned for this channel.")
         else:
-            print(f"\n[ok] got {len(messages)} recent messages; inspecting them:")
-            for i, m in enumerate(messages):
-                md = rb._data_of(m)
-                mid = rb._get(m, "message_id", "id")
-                key, val = extract_views(md)
-                txt = (rb._msg_text_of(m) or "")[:40].replace("\n", " ")
-                line = f"  [{i}] id={mid} views={val if key else '??'} ({key or 'unknown'}) text='{txt}'"
-                print(line)
-            # full dump of the newest message so we can see the view field
-            dump("NEWEST message (raw)", messages[0])
+            newest = messages[0]
+            md = rb._data_of(newest)
+            mid = rb._get(newest, "message_id", "id")
+            print(f"\n[ok] got {len(messages)} messages. newest id={mid}")
+
+            # write the FULL raw newest message to a file (no scrollback pain)
+            out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    "_newest_msg.json")
+            try:
+                with open(out_path, "w", encoding="utf-8") as f:
+                    json.dump(md, f, ensure_ascii=False, indent=2, default=str)
+                print(f"[ok] full newest message written to: {out_path}")
+            except Exception as e:
+                print(f"[warn] could not write file: {e!r}")
+
+            # 1) auto-search the message itself for any view-ish field (any depth)
+            print("\n--- view-ish fields INSIDE get_messages() newest message ---")
+            hits = find_keys(md, VIEW_NEEDLES)
+            if hits:
+                for p, v in hits:
+                    print(f"   {p} = {v}")
+            else:
+                print("   (none found in the message itself)")
+
+            # 2) probe dedicated 'views' methods using the message id
+            print("\n--- trying dedicated view methods ---")
+            tried_any = False
+            for name in ("get_messages_views", "get_message_views",
+                         "get_messages_update", "get_messages_updates"):
+                fn = getattr(client, name, None)
+                if fn is None:
+                    continue
+                tried_any = True
+                try:
+                    res = await _try_call(fn, [
+                        lambda: ((guid, [mid]), {}),
+                        lambda: ((), {"object_guid": guid, "message_ids": [mid]}),
+                        lambda: ((guid, mid), {}),
+                    ])
+                except Exception as e:
+                    print(f"   {name}: ERROR {e!r}")
+                    continue
+                rd = rb._data_of(res)
+                vh = find_keys(rd, VIEW_NEEDLES)
+                print(f"   {name}: OK -> {vh if vh else rd}")
+            if not tried_any:
+                print("   (this rubpy build exposes none of the probed methods)")
     finally:
         try:
             await client.disconnect()
