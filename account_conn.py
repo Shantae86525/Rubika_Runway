@@ -114,8 +114,14 @@ class InvalidAuthError(RuntimeError):
 async def call(phone: str, fn, *args, timeout: float = None, **kwargs):
     """Run ``fn(client, *args, **kwargs)`` on the account's warm connection
     while holding its per-account lock (so only one call touches the session at
-    a time). Reconnects once on a transient connection error. Raises
-    InvalidAuthError if the session is invalid.
+    a time). Raises InvalidAuthError ONLY if the session is truly invalid.
+
+    Robustness: a single INVALID_AUTH on an old/stale warm connection does NOT
+    mean the session is dead — Rubika sometimes returns it on a wedged socket.
+    So on INVALID_AUTH we drop the connection, build a COMPLETELY FRESH one and
+    retry; only if a fresh connection ALSO reports INVALID_AUTH do we declare
+    the session invalid. This stops false "session expired" alarms while the
+    account is in fact still logged in.
 
     NOTE: keep ``fn`` a SHORT single operation and do any sleeping OUTSIDE this
     call, so the other features on the same account get their turn quickly.
@@ -124,7 +130,9 @@ async def call(phone: str, fn, *args, timeout: float = None, **kwargs):
     async with c.lock:
         c.last_used = time.monotonic()
         last_err = None
-        for attempt in (1, 2):
+        auth_failures = 0
+        # up to 3 tries: enough for one stale-conn retry + one transient retry
+        for attempt in range(1, 4):
             try:
                 client = await _ensure_connected(c)
                 if timeout:
@@ -142,13 +150,19 @@ async def call(phone: str, fn, *args, timeout: float = None, **kwargs):
             except Exception as e:  # noqa: BLE001
                 last_err = e
                 if _is_invalid_auth(e):
-                    c.invalid = True
-                    await _drop(c)
-                    await _notify_invalid(c.phone)
-                    raise InvalidAuthError(f"{c.phone}: session invalid") from e
-                # transient/connection error -> drop and retry once
+                    auth_failures += 1
+                    await _drop(c)                 # throw away the stale socket
+                    if auth_failures >= 2:
+                        # a FRESH connection still rejected -> really invalid
+                        c.invalid = True
+                        await _notify_invalid(c.phone)
+                        raise InvalidAuthError(f"{c.phone}: session invalid") from e
+                    # first time: rebuild a brand-new connection and retry
+                    await asyncio.sleep(1.0)
+                    continue
+                # transient/connection error -> drop and retry
                 await _drop(c)
-                if attempt == 2:
+                if attempt >= 3:
                     raise
                 await asyncio.sleep(1.0)
         if last_err:
