@@ -77,10 +77,43 @@ def _get_conn(phone: str) -> _Conn:
 
 
 def is_auth_error(err: Exception) -> bool:
-    """True if the error means the account session is no longer valid."""
-    s = (repr(err) + " " + str(err)).upper()
-    return ("INVALID_AUTH" in s or "NOT_REGISTERED" in s
-            or "INVALIDAUTH" in s or "AUTH_FROM_ANOTHER" in s)
+    """True ONLY for explicit Rubika 'session invalid' signals.
+
+    Deliberately narrow: a banned/muted group, a failed single send, a timeout,
+    or a transient network/connection hiccup must NOT be treated as a dead
+    session. We match the explicit auth tokens Rubika returns when the session
+    itself is revoked, and (importantly) NOT generic words like "error" or
+    "forbidden" that a group-level block would produce.
+    """
+    s = str(err).upper()
+    return ("INVALID_AUTH" in s or "INVALIDAUTH" in s
+            or "NOT_REGISTERED" in s or "AUTH_FROM_ANOTHER" in s)
+
+
+async def verify_session_dead(phone: str) -> bool:
+    """Confirm a suspected dead session with a FRESH connection before we ever
+    declare the account invalid.
+
+    A single auth-looking error can be transient (a wedged socket, a hiccup
+    during connect, Rubika briefly rejecting a reused session). So when a loop
+    sees one, it calls this: we open a brand-new client and do one cheap,
+    read-only call (get_me / get_self_guid). If that succeeds, the session is
+    ALIVE and the earlier error was transient -> return False (do NOT kill the
+    account). Only if the fresh connection ALSO fails with an explicit auth
+    error do we return True (truly dead).
+    """
+    c = _get_conn(phone)
+    async with c.lock:
+        client = None
+        try:
+            client = rb.open_client(c.phone)
+            await rb.connect_ready(client)
+            await asyncio.wait_for(rb.get_self_guid(client), timeout=30)
+            return False                      # fresh connection works -> alive
+        except Exception as e:  # noqa: BLE001
+            return is_auth_error(e)           # dead only if fresh conn auth-fails
+        finally:
+            await _disconnect_quietly(client)
 
 
 class InvalidAuthError(RuntimeError):
@@ -130,7 +163,9 @@ async def connection(phone: str):
 
 async def call(phone: str, fn, *args, timeout: float = None, **kwargs):
     """Run a SINGLE one-off ``fn(client, *args, **kwargs)`` inside one
-    ``connection()``. Raises InvalidAuthError if the session is invalid."""
+    ``connection()``. On an auth-looking error, CONFIRM with a fresh connection
+    before raising InvalidAuthError (so a transient hiccup never kills a healthy
+    account)."""
     try:
         async with connection(phone) as client:
             if timeout:
@@ -140,7 +175,7 @@ async def call(phone: str, fn, *args, timeout: float = None, **kwargs):
     except InvalidAuthError:
         raise
     except Exception as e:  # noqa: BLE001
-        if is_auth_error(e):
+        if is_auth_error(e) and await verify_session_dead(phone):
             await notify_invalid(phone)
             raise InvalidAuthError(f"{_key(phone)}: session invalid") from e
         raise

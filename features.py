@@ -65,6 +65,22 @@ async def _log_invalid(phone: str):
     ]))
 
 
+async def _handle_auth_error(phone: str) -> bool:
+    """Called when a loop hit an auth-looking error. Confirm with a FRESH
+    connection before declaring the account dead. Returns True if the loop
+    should stop (truly dead -> notify + log), False if it was transient (a
+    banned/muted group, a hiccup, etc.) and the loop should just continue."""
+    try:
+        dead = await account_conn.verify_session_dead(phone)
+    except Exception:
+        dead = False                 # if even the check fails, assume transient
+    if dead:
+        await account_conn.notify_invalid(phone)
+        await _log_invalid(phone)
+        return True
+    return False
+
+
 async def _sleep_interruptible(st: dict, seconds: float):
     waited = 0.0
     while waited < seconds and not st.get("stop"):
@@ -160,16 +176,15 @@ async def run_secretary_local(account_id: int, phone: str, st: dict):
                             f"🕒 {_now()}"]))
                     await asyncio.sleep(config.SECRETARY_REPLY_DELAY)
         except account_conn.InvalidAuthError:
-            await account_conn.notify_invalid(phone)
-            await _log_invalid(phone)
-            break
+            if await _handle_auth_error(phone):
+                break
         except Exception as e:  # noqa: BLE001
             if account_conn.is_auth_error(e):
-                await account_conn.notify_invalid(phone)
-                await _log_invalid(phone)
-                break
-            await _log(_card("⚠️ منشی — خطای حلقه", [
-                f"👤 Account : {phone}", f"💥 {repr(e)[:160]}", f"🕒 {_now()}"]))
+                if await _handle_auth_error(phone):
+                    break
+            else:
+                await _log(_card("⚠️ منشی — خطای حلقه", [
+                    f"👤 Account : {phone}", f"💥 {repr(e)[:160]}", f"🕒 {_now()}"]))
         iv = (db.get_secretary(account_id).get("interval_sec")
               or config.SECRETARY_INTERVAL)
         await _sleep_interruptible(st, iv)
@@ -217,19 +232,18 @@ async def run_channel_report_local(account_id: int, phone: str, st: dict):
                     f"{views if views is not None else 'نامشخص'}",
                     f"🕒 {_now()}"]))
             except account_conn.InvalidAuthError:
-                await account_conn.notify_invalid(phone)
-                await _log_invalid(phone)
-                break
+                if await _handle_auth_error(phone):
+                    break
             except Exception as e:  # noqa: BLE001
                 if account_conn.is_auth_error(e):
-                    await account_conn.notify_invalid(phone)
-                    await _log_invalid(phone)
-                    break
-                await _log(_card("⚠️ گزارش کانال — خطا", [
-                    f"👤 Account : {phone}",
-                    f"🆔 Channel : {guid}",
-                    f"💥 {repr(e)[:160]}",
-                    f"🕒 {_now()}"]))
+                    if await _handle_auth_error(phone):
+                        break
+                else:
+                    await _log(_card("⚠️ گزارش کانال — خطا", [
+                        f"👤 Account : {phone}",
+                        f"🆔 Channel : {guid}",
+                        f"💥 {repr(e)[:160]}",
+                        f"🕒 {_now()}"]))
         await _sleep_interruptible(st, iv)
 
 
@@ -332,14 +346,13 @@ async def run_reply_local(account_id: int, phone: str, st: dict):
                                 f"💥 {repr(e)[:160]}",
                                 f"🕒 {_now()}"]))
         except account_conn.InvalidAuthError:
-            await account_conn.notify_invalid(phone)
-            await _log_invalid(phone)
-            break
+            if await _handle_auth_error(phone):
+                break
         except Exception as e:  # noqa: BLE001
             if account_conn.is_auth_error(e):
-                await account_conn.notify_invalid(phone)
-                await _log_invalid(phone)
-                break
-            await _log(_card("⚠️ ریپلای — خطای حلقه", [
-                f"👤 Account : {phone}", f"💥 {repr(e)[:160]}", f"🕒 {_now()}"]))
+                if await _handle_auth_error(phone):
+                    break
+            else:
+                await _log(_card("⚠️ ریپلای — خطای حلقه", [
+                    f"👤 Account : {phone}", f"💥 {repr(e)[:160]}", f"🕒 {_now()}"]))
         await _sleep_interruptible(st, config.REPLY_POLL_INTERVAL)

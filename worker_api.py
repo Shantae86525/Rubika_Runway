@@ -78,6 +78,20 @@ async def _worker_on_invalid(phone: str):
         f"🕒 {_now()}"]))
 
 
+async def _handle_auth_error(phone: str) -> bool:
+    """Confirm a suspected dead session with a FRESH connection before declaring
+    it dead. Returns True if the loop should stop (truly dead), False if it was
+    a transient error (banned/muted group, hiccup) and the loop should go on."""
+    try:
+        dead = await account_conn.verify_session_dead(phone)
+    except Exception:
+        dead = False
+    if dead:
+        await account_conn.notify_invalid(phone)
+        return True
+    return False
+
+
 async def _apply_profile(client, first, last, bio):
     """Update name/bio only if different from current. Returns True if changed."""
     cur = await rb.get_my_profile(client)
@@ -568,12 +582,12 @@ async def _run_automation(phone: str, state: dict):
                         state["skipped"].clear()
                         fails.clear()
             except account_conn.InvalidAuthError:
-                await account_conn.notify_invalid(phone)
-                break
+                if await _handle_auth_error(phone):
+                    break
             except Exception as e:  # noqa: BLE001
                 if account_conn.is_auth_error(e):
-                    await account_conn.notify_invalid(phone)
-                    break
+                    if await _handle_auth_error(phone):
+                        break
             waited = 0
             while waited < state["interval"] and not state["stop"]:
                 await asyncio.sleep(1)
@@ -697,13 +711,14 @@ async def _run_secretary(phone: str, st: dict):
                             f"💥 {repr(e)[:140]}", f"🕒 {_now()}"]))
                     await asyncio.sleep(config.SECRETARY_REPLY_DELAY)
         except account_conn.InvalidAuthError:
-            await account_conn.notify_invalid(phone)
-            break
+            if await _handle_auth_error(phone):
+                break
         except Exception as e:  # noqa: BLE001
             if account_conn.is_auth_error(e):
-                await account_conn.notify_invalid(phone)
-                break
-            _qlog(_wcard("⚠️ منشی — خطای حلقه", [
+                if await _handle_auth_error(phone):
+                    break
+            else:
+                _qlog(_wcard("⚠️ منشی — خطای حلقه", [
                 f"👤 Account : {phone}", f"💥 {repr(e)[:140]}", f"🕒 {_now()}"]))
         await _state_sleep(st, st["interval"])
 
@@ -742,15 +757,16 @@ async def _run_channelreport(phone: str, st: dict):
                     f"{views if views is not None else 'نامشخص'}",
                     f"🕒 {_now()}"]))
             except account_conn.InvalidAuthError:
-                await account_conn.notify_invalid(phone)
-                break
+                if await _handle_auth_error(phone):
+                    break
             except Exception as e:  # noqa: BLE001
                 if account_conn.is_auth_error(e):
-                    await account_conn.notify_invalid(phone)
-                    break
-                _qlog(_wcard("⚠️ گزارش کانال — خطا", [
-                    f"👤 Account : {phone}", f"🆔 Channel : {guid}",
-                    f"💥 {repr(e)[:140]}", f"🕒 {_now()}"]))
+                    if await _handle_auth_error(phone):
+                        break
+                else:
+                    _qlog(_wcard("⚠️ گزارش کانال — خطا", [
+                        f"👤 Account : {phone}", f"🆔 Channel : {guid}",
+                        f"💥 {repr(e)[:140]}", f"🕒 {_now()}"]))
         await _state_sleep(st, iv)
 
 
@@ -837,14 +853,15 @@ async def _run_reply(phone: str, st: dict):
                                 f"👤 Account : {phone}", f"👥 Group : {gguid}",
                                 f"💥 {repr(e)[:140]}", f"🕒 {_now()}"]))
         except account_conn.InvalidAuthError:
-            await account_conn.notify_invalid(phone)
-            break
+            if await _handle_auth_error(phone):
+                break
         except Exception as e:  # noqa: BLE001
             if account_conn.is_auth_error(e):
-                await account_conn.notify_invalid(phone)
-                break
-            _qlog(_wcard("⚠️ ریپلای — خطای حلقه", [
-                f"👤 Account : {phone}", f"💥 {repr(e)[:140]}", f"🕒 {_now()}"]))
+                if await _handle_auth_error(phone):
+                    break
+            else:
+                _qlog(_wcard("⚠️ ریپلای — خطای حلقه", [
+                    f"👤 Account : {phone}", f"💥 {repr(e)[:140]}", f"🕒 {_now()}"]))
         await _state_sleep(st, config.REPLY_POLL_INTERVAL)
 
 
