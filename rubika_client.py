@@ -810,16 +810,24 @@ async def get_last_post_views(client: Client, channel_guid: str):
 # Feature 1 & 5: chat updates polling (new PVs / new group messages).
 # --------------------------------------------------------------------------- #
 async def get_chats_updates(client: Client, state):
-    """Call get_chats_updates(state). `state` is the cursor returned previously
-    (a number/string); pass '' or 0 the first time."""
+    """Call get_chats_updates(state). rubpy expects an INTEGER state (unix
+    seconds). An empty/None/0 state means 'first run': we pass nothing and let
+    rubpy default it (it uses ~now-200s, so we don't pull the whole history).
+    Passing '' directly makes rubpy run int('') and crash, so we coerce here."""
     fn = getattr(client, "get_chats_updates", None)
     if fn is None:
         raise RuntimeError("this rubpy build has no get_chats_updates()")
+    s = None
+    if state not in (None, "", "0", 0):
+        try:
+            s = int(state)
+        except (TypeError, ValueError):
+            s = None
     try:
-        return await fn(state)
+        return await fn() if s is None else await fn(s)
     except TypeError:
         try:
-            return await fn(state=state)
+            return await fn(state=s) if s is not None else await fn()
         except TypeError:
             return await fn()
 
@@ -827,10 +835,14 @@ async def get_chats_updates(client: Client, state):
 def parse_chats_updates(result):
     """Return (chats: list, new_state: str|None) from a get_chats_updates() result."""
     d = _data_of(result)
-    chats = d.get("chats")
-    if chats is None and isinstance(d.get("chats_updates"), list):
-        chats = d.get("chats_updates")
-    new_state = d.get("new_state") or d.get("state") or d.get("timestamp")
+    chats = None
+    for key in ("chats", "chats_updates", "updated_chats", "chat_updates"):
+        v = d.get(key)
+        if isinstance(v, list):
+            chats = v
+            break
+    new_state = (d.get("new_state") or d.get("state") or d.get("next_state")
+                 or d.get("timestamp"))
     return (chats or []), new_state
 
 
