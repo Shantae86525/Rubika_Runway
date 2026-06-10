@@ -185,11 +185,15 @@ async def log(text: str):
         print(f"[log error] {e}")
 
 
-async def _log_invalid_auth(phone: str):
+async def _log_invalid_auth(phone: str, detail: str = ""):
     """Log that an account's session is truly invalid (device kicked out / login
     revoked) AFTER a fresh-connection retry already failed. Per the owner this is
     expected, not a bug. Marks the account inactive so the panel shows a
-    one-tap re-login button, and tells the user how to recover it."""
+    one-tap re-login button, and tells the user how to recover it.
+
+    ``detail`` carries the REAL underlying error text so we stop guessing why a
+    session was rejected.
+    """
     try:
         for a in db.list_accounts():
             if rb.normalize_phone(a["phone"]) == rb.normalize_phone(phone):
@@ -202,8 +206,10 @@ async def _log_invalid_auth(phone: str):
         "📵 این سشن از روبیکا بیرون انداخته شده (دیوایس logout شده).",
         "همه‌ی قابلیت‌های این اکانت موقتاً متوقف شدن.",
         "🔁 برای ریکاوری: «👤 اکانت‌های من» → همین اکانت → «🔁 لاگین مجدد».",
-        f"🕒 {now()}",
     ]
+    if detail:
+        rows.append(f"🧩 جزئیات خطا: {detail[:200]}")
+    rows.append(f"🕒 {now()}")
     await log(card("🔐 INVALID_AUTH — نیاز به لاگین مجدد", rows))
 
 
@@ -486,9 +492,17 @@ async def relogin_cb(event):
         await _begin_local_login(event, phone, w)
 
 
-async def _recover_account_features(account_id: int):
+async def _recover_account_features(account_id: int, settle_delay: float = 0.0):
     """After a (re)login, relaunch every always-on feature that is still marked
-    enabled for this account, so recovery is automatic."""
+    enabled for this account, so recovery is automatic.
+
+    ``settle_delay``: wait this many seconds before relaunching, so a freshly
+    created session has time to fully settle on Rubika's side. Relaunching heavy
+    activity on a brand-new session immediately can make Rubika reject it with a
+    (transient) INVALID_AUTH right after adding the account.
+    """
+    if settle_delay:
+        await asyncio.sleep(settle_delay)
     acc = db.get_account(account_id)
     if not acc:
         return
@@ -883,11 +897,14 @@ async def complete_account(event):
             pass
 
     # re-login recovery runs ONLY after the login client is fully disconnected,
-    # so the recovered features never open a second connection alongside it.
+    # so the recovered features never open a second connection alongside it. We
+    # run it in the BACKGROUND with a settle delay so the freshly created
+    # session has time to stabilise on Rubika's side (relaunching heavy activity
+    # immediately can trigger a transient INVALID_AUTH right after adding).
     if account_id:
         try:
             account_conn.reset_invalid(phone)
-            await _recover_account_features(account_id)
+            asyncio.create_task(_recover_account_features(account_id, settle_delay=8.0))
         except Exception:
             pass
 
@@ -2397,18 +2414,32 @@ async def run_automation_local(account_id: int, phone: str, st: dict):
                     if groups and all(g["guid"] in st["skipped"] for g in groups):
                         st["skipped"].clear()
                         fails.clear()
-            except account_conn.InvalidAuthError:
-                await _log_invalid_auth(phone)
+            except account_conn.InvalidAuthError as e:
+                # account_conn already CONFIRMED it dead via a fresh connection
+                await _log_invalid_auth(phone, detail=repr(e))
                 break
             except Exception as e:  # noqa: BLE001
                 if account_conn.is_auth_error(e):
-                    await _log_invalid_auth(phone)
-                    break
-                # any other per-pass error (incl. a dropped stuck socket): drop
-                # the connection so next pass is fresh, log once, and CONTINUE
-                # the loop (do NOT kill automation).
-                account_conn.drop_connection(phone)
-                await log(f"⚠️ اتومیشن «{phone}» خطای دور (ادامه می‌دهد): {repr(e)[:150]}")
+                    # don't trust a single auth-looking error: confirm on a
+                    # brand-new connection first (same as secretary/reply). A
+                    # transient hiccup must NOT kill a healthy account.
+                    try:
+                        really_dead = await account_conn.verify_session_dead(phone)
+                    except Exception:
+                        really_dead = False
+                    if really_dead:
+                        await account_conn.notify_invalid(phone)
+                        await _log_invalid_auth(phone, detail=repr(e))
+                        break
+                    # transient -> log the real error, drop conn, keep going
+                    account_conn.drop_connection(phone)
+                    await log(f"⚠️ اتومیشن «{phone}» خطای گذرای auth (ادامه می‌دهد): {repr(e)[:150]}")
+                else:
+                    # any other per-pass error (incl. a dropped stuck socket):
+                    # drop the connection so next pass is fresh, log once, and
+                    # CONTINUE the loop (do NOT kill automation).
+                    account_conn.drop_connection(phone)
+                    await log(f"⚠️ اتومیشن «{phone}» خطای دور (ادامه می‌دهد): {repr(e)[:150]}")
             st["heartbeat"] = time.monotonic()
             waited = 0
             while waited < st["interval"] and not st["stop"]:
