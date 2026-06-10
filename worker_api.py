@@ -557,11 +557,9 @@ async def _run_automation(phone: str, state: dict):
                     try:
                         groups = await asyncio.wait_for(
                             rb.get_group_guids(client), timeout=60)
-                    except Exception as e:  # noqa: BLE001
-                        if account_conn.is_auth_error(e):
-                            raise
-                        account_conn.drop_connection(phone)
+                    except Exception:
                         groups = []
+                        account_conn.drop_connection(phone)
                     state["groups"] = len(groups)
                     for g in groups:
                         if state["stop"]:
@@ -579,9 +577,10 @@ async def _run_automation(phone: str, state: dict):
                             state["sent"] += 1
                             last_text[guid] = idx
                             fails[guid] = 0
-                        except Exception as e:  # noqa: BLE001
-                            if account_conn.is_auth_error(e):
-                                raise
+                        except Exception:
+                            # ANY send failure -> count against THIS group, mute
+                            # after 3 strikes. Never declare the account dead and
+                            # never open a second connection to "verify".
                             fails[guid] = fails.get(guid, 0) + 1
                             if fails[guid] >= 3:
                                 state["skipped"].add(guid)
@@ -591,13 +590,10 @@ async def _run_automation(phone: str, state: dict):
                     if groups and all(g["guid"] in state["skipped"] for g in groups):
                         state["skipped"].clear()
                         fails.clear()
-            except account_conn.InvalidAuthError:
-                if await _handle_auth_error(phone):
-                    break
-            except Exception as e:  # noqa: BLE001
-                if account_conn.is_auth_error(e):
-                    if await _handle_auth_error(phone):
-                        break
+                        account_conn.drop_connection(phone)
+            except Exception:
+                # whole-pass error -> drop connection, continue next round.
+                account_conn.drop_connection(phone)
             waited = 0
             while waited < state["interval"] and not state["stop"]:
                 await asyncio.sleep(1)

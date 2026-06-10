@@ -2362,18 +2362,18 @@ async def run_automation_local(account_id: int, phone: str, st: dict):
         while not st["stop"]:
             st["heartbeat"] = time.monotonic()   # watchdog: prove we're alive
             try:
+                # ONE connection for this whole pass (per-account lock inside
+                # connection() prevents parallel use by secretary/reply).
                 async with account_conn.connection(phone) as client:
                     try:
                         groups = await asyncio.wait_for(
                             rb.get_group_guids(client), timeout=60)
-                    except Exception as e:  # noqa: BLE001
-                        if account_conn.is_auth_error(e):
-                            raise
-                        # a stuck/slow call may have left the socket half-dead;
-                        # drop it so the NEXT pass reconnects fresh instead of
-                        # silently reusing a broken connection.
-                        account_conn.drop_connection(phone)
+                    except Exception:
+                        # could not read groups this pass -> drop the (maybe
+                        # wedged) socket and try again next round. NEVER kill the
+                        # loop, NEVER open a second connection to "verify".
                         groups = []
+                        account_conn.drop_connection(phone)
                     st["groups"] = len(groups)
                     for g in groups:
                         if st["stop"]:
@@ -2388,58 +2388,37 @@ async def run_automation_local(account_id: int, phone: str, st: dict):
                             await asyncio.wait_for(
                                 rb.send_text(client, guid, txt),
                                 timeout=config.SEND_TIMEOUT)
-                        except Exception as e:  # noqa: BLE001
-                            if account_conn.is_auth_error(e):
-                                raise
-                            if isinstance(e, asyncio.TimeoutError):
-                                # a stuck send can wedge the socket -> drop it so
-                                # the next pass reconnects; end this pass now.
-                                account_conn.drop_connection(phone)
-                                raise
+                        except Exception:
+                            # ANY send failure (banned/muted group, transient
+                            # auth hiccup, timeout, ...) is treated EXACTLY like
+                            # the original code: count it against THIS group and
+                            # mute the group after 3 strikes. We do NOT declare
+                            # the account dead and do NOT stop the loop — that
+                            # false-positive was what silently halted automation.
                             fails[guid] = fails.get(guid, 0) + 1
                             if fails[guid] >= 3:
-                                st["skipped"].add(guid)   # mute after 3 failures
+                                st["skipped"].add(guid)
                         else:
                             st["sent"] += 1
                             last_text[guid] = idx
                             fails[guid] = 0
-                            try:                  # a brief DB lock must NOT count as a send error
+                            try:              # a brief DB lock must NOT count as a send error
                                 db.incr_automation_sent(account_id, 1)
                             except Exception:
                                 pass
                         await asyncio.sleep(random.uniform(
                             config.AUTOMATION_GROUP_DELAY_MIN,
                             config.AUTOMATION_GROUP_DELAY_MAX))
-                    # recovery: if every group ended up muted, reset
+                    # recovery: if every group ended up muted, reset + reconnect
                     if groups and all(g["guid"] in st["skipped"] for g in groups):
                         st["skipped"].clear()
                         fails.clear()
-            except account_conn.InvalidAuthError as e:
-                # account_conn already CONFIRMED it dead via a fresh connection
-                await _log_invalid_auth(phone, detail=repr(e))
-                break
+                        account_conn.drop_connection(phone)
             except Exception as e:  # noqa: BLE001
-                if account_conn.is_auth_error(e):
-                    # don't trust a single auth-looking error: confirm on a
-                    # brand-new connection first (same as secretary/reply). A
-                    # transient hiccup must NOT kill a healthy account.
-                    try:
-                        really_dead = await account_conn.verify_session_dead(phone)
-                    except Exception:
-                        really_dead = False
-                    if really_dead:
-                        await account_conn.notify_invalid(phone)
-                        await _log_invalid_auth(phone, detail=repr(e))
-                        break
-                    # transient -> log the real error, drop conn, keep going
-                    account_conn.drop_connection(phone)
-                    await log(f"⚠️ اتومیشن «{phone}» خطای گذرای auth (ادامه می‌دهد): {repr(e)[:150]}")
-                else:
-                    # any other per-pass error (incl. a dropped stuck socket):
-                    # drop the connection so next pass is fresh, log once, and
-                    # CONTINUE the loop (do NOT kill automation).
-                    account_conn.drop_connection(phone)
-                    await log(f"⚠️ اتومیشن «{phone}» خطای دور (ادامه می‌دهد): {repr(e)[:150]}")
+                # a whole-pass error: drop the connection so the next pass is
+                # fresh, log once, and CONTINUE (never kill automation).
+                account_conn.drop_connection(phone)
+                await log(f"⚠️ اتومیشن «{phone}» خطای دور (ادامه می‌دهد): {repr(e)[:150]}")
             st["heartbeat"] = time.monotonic()
             waited = 0
             while waited < st["interval"] and not st["stop"]:
