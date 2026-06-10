@@ -126,6 +126,89 @@ def init():
         """
     )
 
+    # ---- Automation EXTRAS tables (additive; secretary / channel report /
+    #      reply responder / profile sync / verified group links) ----
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS secretary (
+            account_id    INTEGER PRIMARY KEY,
+            enabled       INTEGER DEFAULT 0,
+            mode          TEXT DEFAULT 'marker',   -- 'marker' or 'text'
+            text          TEXT DEFAULT '',
+            interval_sec  INTEGER DEFAULT 600,
+            state         TEXT DEFAULT '',          -- last get_chats_updates state
+            replied_total INTEGER DEFAULT 0,
+            updated_at    TEXT
+        )
+        """
+    )
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS secretary_replied (
+            account_id INTEGER,
+            user_guid  TEXT,
+            replied_at TEXT,
+            PRIMARY KEY (account_id, user_guid)
+        )
+        """
+    )
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS channel_report (
+            account_id    INTEGER PRIMARY KEY,
+            enabled       INTEGER DEFAULT 0,
+            channel_guid  TEXT DEFAULT '',
+            channel_title TEXT DEFAULT '',
+            interval_sec  INTEGER DEFAULT 600,
+            updated_at    TEXT
+        )
+        """
+    )
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS reply_responder (
+            account_id    INTEGER PRIMARY KEY,
+            enabled       INTEGER DEFAULT 0,
+            text          TEXT DEFAULT '',
+            delay_sec     REAL DEFAULT 2.0,
+            replied_total INTEGER DEFAULT 0,
+            updated_at    TEXT
+        )
+        """
+    )
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS reply_done (
+            account_id INTEGER,
+            message_id TEXT,
+            done_at    TEXT,
+            PRIMARY KEY (account_id, message_id)
+        )
+        """
+    )
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS profile_sync (
+            id         INTEGER PRIMARY KEY CHECK (id = 1),
+            first_name TEXT DEFAULT '',
+            last_name  TEXT DEFAULT '',
+            bio        TEXT DEFAULT '',
+            updated_at TEXT
+        )
+        """
+    )
+    c.execute("INSERT OR IGNORE INTO profile_sync (id, first_name, last_name, bio) "
+              "VALUES (1, '', '', '')")
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS verified_group_links (
+            link     TEXT PRIMARY KEY,
+            added_by TEXT,
+            added_at TEXT
+        )
+        """
+    )
+
     # ---- migration: add accounts.worker_id (account -> worker affinity) ----
     cols = [r["name"] for r in c.execute("PRAGMA table_info(accounts)").fetchall()]
     if "worker_id" not in cols:
@@ -178,6 +261,13 @@ def delete_account(account_id: int):
     conn.execute("DELETE FROM automation WHERE account_id = ?", (account_id,))
     conn.execute("DELETE FROM automation_texts WHERE account_id = ?", (account_id,))
     conn.execute("DELETE FROM automation_links WHERE account_id = ?", (account_id,))
+    # automation EXTRAS cleanup (best-effort; tables always exist after init())
+    for tbl in ("secretary", "secretary_replied", "channel_report",
+                "reply_responder", "reply_done"):
+        try:
+            conn.execute(f"DELETE FROM {tbl} WHERE account_id = ?", (account_id,))
+        except Exception:
+            pass
     conn.commit()
     conn.close()
 
@@ -499,3 +589,325 @@ def clear_automation_links(account_id: int):
     conn.execute("DELETE FROM automation_links WHERE account_id = ?", (int(account_id),))
     conn.commit()
     conn.close()
+
+
+
+# --------------------------------------------------------------------------- #
+# Automation EXTRAS accessors (additive). One row per account where noted.
+# --------------------------------------------------------------------------- #
+
+# ---------- Feature 1: PV secretary ----------
+def _ensure_secretary_row(c, account_id: int):
+    c.execute(
+        "INSERT OR IGNORE INTO secretary (account_id, enabled, mode, text, "
+        "interval_sec, state, replied_total, updated_at) "
+        "VALUES (?, 0, 'marker', '', ?, '', 0, ?)",
+        (int(account_id), config.SECRETARY_INTERVAL, _now()),
+    )
+
+
+def get_secretary(account_id: int) -> dict:
+    conn = _conn()
+    c = conn.cursor()
+    _ensure_secretary_row(c, account_id)
+    conn.commit()
+    row = c.execute("SELECT * FROM secretary WHERE account_id = ?",
+                    (int(account_id),)).fetchone()
+    conn.close()
+    return dict(row) if row else {"account_id": account_id, "enabled": 0,
+                                  "mode": "marker", "text": "",
+                                  "interval_sec": config.SECRETARY_INTERVAL,
+                                  "state": "", "replied_total": 0}
+
+
+def set_secretary_enabled(account_id: int, enabled: bool):
+    conn = _conn()
+    c = conn.cursor()
+    _ensure_secretary_row(c, account_id)
+    c.execute("UPDATE secretary SET enabled = ?, updated_at = ? WHERE account_id = ?",
+              (1 if enabled else 0, _now(), int(account_id)))
+    conn.commit()
+    conn.close()
+
+
+def set_secretary_mode(account_id: int, mode: str):
+    mode = "text" if str(mode).lower() == "text" else "marker"
+    conn = _conn()
+    c = conn.cursor()
+    _ensure_secretary_row(c, account_id)
+    c.execute("UPDATE secretary SET mode = ?, updated_at = ? WHERE account_id = ?",
+              (mode, _now(), int(account_id)))
+    conn.commit()
+    conn.close()
+
+
+def set_secretary_text(account_id: int, text: str):
+    conn = _conn()
+    c = conn.cursor()
+    _ensure_secretary_row(c, account_id)
+    c.execute("UPDATE secretary SET text = ?, updated_at = ? WHERE account_id = ?",
+              (text or "", _now(), int(account_id)))
+    conn.commit()
+    conn.close()
+
+
+def set_secretary_interval(account_id: int, interval_sec):
+    conn = _conn()
+    c = conn.cursor()
+    _ensure_secretary_row(c, account_id)
+    c.execute("UPDATE secretary SET interval_sec = ?, updated_at = ? WHERE account_id = ?",
+              (config.clamp_secretary_interval(interval_sec), _now(), int(account_id)))
+    conn.commit()
+    conn.close()
+
+
+def set_secretary_state(account_id: int, state: str):
+    conn = _conn()
+    c = conn.cursor()
+    _ensure_secretary_row(c, account_id)
+    c.execute("UPDATE secretary SET state = ? WHERE account_id = ?",
+              (str(state or ""), int(account_id)))
+    conn.commit()
+    conn.close()
+
+
+def incr_secretary_replied(account_id: int, n: int = 1):
+    conn = _conn()
+    c = conn.cursor()
+    _ensure_secretary_row(c, account_id)
+    c.execute("UPDATE secretary SET replied_total = replied_total + ? WHERE account_id = ?",
+              (int(n), int(account_id)))
+    conn.commit()
+    conn.close()
+
+
+def list_enabled_secretaries() -> list:
+    conn = _conn()
+    rows = conn.execute("SELECT * FROM secretary WHERE enabled = 1").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def secretary_already_replied(account_id: int, user_guid: str) -> bool:
+    conn = _conn()
+    row = conn.execute(
+        "SELECT 1 FROM secretary_replied WHERE account_id = ? AND user_guid = ?",
+        (int(account_id), str(user_guid))).fetchone()
+    conn.close()
+    return bool(row)
+
+
+def mark_secretary_replied(account_id: int, user_guid: str):
+    conn = _conn()
+    conn.execute(
+        "INSERT OR IGNORE INTO secretary_replied (account_id, user_guid, replied_at) "
+        "VALUES (?, ?, ?)", (int(account_id), str(user_guid), _now()))
+    conn.commit()
+    conn.close()
+
+
+def clear_secretary_replied(account_id: int):
+    conn = _conn()
+    conn.execute("DELETE FROM secretary_replied WHERE account_id = ?", (int(account_id),))
+    conn.commit()
+    conn.close()
+
+
+# ---------- Feature 2: channel report ----------
+def _ensure_channel_report_row(c, account_id: int):
+    c.execute(
+        "INSERT OR IGNORE INTO channel_report (account_id, enabled, channel_guid, "
+        "channel_title, interval_sec, updated_at) VALUES (?, 0, '', '', ?, ?)",
+        (int(account_id), config.CHANNEL_REPORT_INTERVAL, _now()),
+    )
+
+
+def get_channel_report(account_id: int) -> dict:
+    conn = _conn()
+    c = conn.cursor()
+    _ensure_channel_report_row(c, account_id)
+    conn.commit()
+    row = c.execute("SELECT * FROM channel_report WHERE account_id = ?",
+                    (int(account_id),)).fetchone()
+    conn.close()
+    return dict(row) if row else {"account_id": account_id, "enabled": 0,
+                                  "channel_guid": "", "channel_title": "",
+                                  "interval_sec": config.CHANNEL_REPORT_INTERVAL}
+
+
+def set_channel_report_enabled(account_id: int, enabled: bool):
+    conn = _conn()
+    c = conn.cursor()
+    _ensure_channel_report_row(c, account_id)
+    c.execute("UPDATE channel_report SET enabled = ?, updated_at = ? WHERE account_id = ?",
+              (1 if enabled else 0, _now(), int(account_id)))
+    conn.commit()
+    conn.close()
+
+
+def set_channel_report_target(account_id: int, channel_guid: str, channel_title: str = ""):
+    conn = _conn()
+    c = conn.cursor()
+    _ensure_channel_report_row(c, account_id)
+    c.execute("UPDATE channel_report SET channel_guid = ?, channel_title = ?, "
+              "updated_at = ? WHERE account_id = ?",
+              (str(channel_guid or ""), str(channel_title or ""), _now(), int(account_id)))
+    conn.commit()
+    conn.close()
+
+
+def set_channel_report_interval(account_id: int, interval_sec):
+    conn = _conn()
+    c = conn.cursor()
+    _ensure_channel_report_row(c, account_id)
+    c.execute("UPDATE channel_report SET interval_sec = ?, updated_at = ? WHERE account_id = ?",
+              (config.clamp_channel_report_interval(interval_sec), _now(), int(account_id)))
+    conn.commit()
+    conn.close()
+
+
+def list_enabled_channel_reports() -> list:
+    conn = _conn()
+    rows = conn.execute("SELECT * FROM channel_report WHERE enabled = 1").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+# ---------- Feature 3: profile sync (global, single row) ----------
+def get_profile_sync() -> dict:
+    conn = _conn()
+    row = conn.execute("SELECT * FROM profile_sync WHERE id = 1").fetchone()
+    conn.close()
+    return dict(row) if row else {"first_name": "", "last_name": "", "bio": ""}
+
+
+def set_profile_sync(first_name: str, last_name: str, bio: str):
+    conn = _conn()
+    conn.execute(
+        "INSERT INTO profile_sync (id, first_name, last_name, bio, updated_at) "
+        "VALUES (1, ?, ?, ?, ?) "
+        "ON CONFLICT(id) DO UPDATE SET first_name=excluded.first_name, "
+        "last_name=excluded.last_name, bio=excluded.bio, updated_at=excluded.updated_at",
+        (first_name or "", last_name or "", bio or "", _now()),
+    )
+    conn.commit()
+    conn.close()
+
+
+# ---------- Feature 5: reply responder ----------
+def _ensure_reply_row(c, account_id: int):
+    c.execute(
+        "INSERT OR IGNORE INTO reply_responder (account_id, enabled, text, "
+        "delay_sec, replied_total, updated_at) VALUES (?, 0, '', ?, 0, ?)",
+        (int(account_id), config.REPLY_DELAY, _now()),
+    )
+
+
+def get_reply_responder(account_id: int) -> dict:
+    conn = _conn()
+    c = conn.cursor()
+    _ensure_reply_row(c, account_id)
+    conn.commit()
+    row = c.execute("SELECT * FROM reply_responder WHERE account_id = ?",
+                    (int(account_id),)).fetchone()
+    conn.close()
+    return dict(row) if row else {"account_id": account_id, "enabled": 0,
+                                  "text": "", "delay_sec": config.REPLY_DELAY,
+                                  "replied_total": 0}
+
+
+def set_reply_enabled(account_id: int, enabled: bool):
+    conn = _conn()
+    c = conn.cursor()
+    _ensure_reply_row(c, account_id)
+    c.execute("UPDATE reply_responder SET enabled = ?, updated_at = ? WHERE account_id = ?",
+              (1 if enabled else 0, _now(), int(account_id)))
+    conn.commit()
+    conn.close()
+
+
+def set_reply_text(account_id: int, text: str):
+    conn = _conn()
+    c = conn.cursor()
+    _ensure_reply_row(c, account_id)
+    c.execute("UPDATE reply_responder SET text = ?, updated_at = ? WHERE account_id = ?",
+              (text or "", _now(), int(account_id)))
+    conn.commit()
+    conn.close()
+
+
+def set_reply_delay(account_id: int, delay_sec):
+    conn = _conn()
+    c = conn.cursor()
+    _ensure_reply_row(c, account_id)
+    c.execute("UPDATE reply_responder SET delay_sec = ?, updated_at = ? WHERE account_id = ?",
+              (config.clamp_reply_delay(delay_sec), _now(), int(account_id)))
+    conn.commit()
+    conn.close()
+
+
+def incr_reply_replied(account_id: int, n: int = 1):
+    conn = _conn()
+    c = conn.cursor()
+    _ensure_reply_row(c, account_id)
+    c.execute("UPDATE reply_responder SET replied_total = replied_total + ? WHERE account_id = ?",
+              (int(n), int(account_id)))
+    conn.commit()
+    conn.close()
+
+
+def list_enabled_reply_responders() -> list:
+    conn = _conn()
+    rows = conn.execute("SELECT * FROM reply_responder WHERE enabled = 1").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def reply_already_done(account_id: int, message_id: str) -> bool:
+    conn = _conn()
+    row = conn.execute(
+        "SELECT 1 FROM reply_done WHERE account_id = ? AND message_id = ?",
+        (int(account_id), str(message_id))).fetchone()
+    conn.close()
+    return bool(row)
+
+
+def mark_reply_done(account_id: int, message_id: str):
+    conn = _conn()
+    conn.execute(
+        "INSERT OR IGNORE INTO reply_done (account_id, message_id, done_at) "
+        "VALUES (?, ?, ?)", (int(account_id), str(message_id), _now()))
+    conn.commit()
+    conn.close()
+
+
+# ---------- Feature 4: verified (successfully joined) group links, shared ----
+def add_verified_group_link(link: str, added_by: str = ""):
+    conn = _conn()
+    conn.execute(
+        "INSERT OR IGNORE INTO verified_group_links (link, added_by, added_at) "
+        "VALUES (?, ?, ?)", (str(link), str(added_by or ""), _now()))
+    conn.commit()
+    conn.close()
+
+
+def list_verified_group_links() -> list:
+    conn = _conn()
+    rows = conn.execute(
+        "SELECT link FROM verified_group_links ORDER BY added_at").fetchall()
+    conn.close()
+    return [r["link"] for r in rows]
+
+
+def clear_verified_group_links():
+    conn = _conn()
+    conn.execute("DELETE FROM verified_group_links")
+    conn.commit()
+    conn.close()
+
+
+def count_verified_group_links() -> int:
+    conn = _conn()
+    row = conn.execute("SELECT COUNT(*) AS n FROM verified_group_links").fetchone()
+    conn.close()
+    return int(row["n"]) if row else 0

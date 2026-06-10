@@ -1,4 +1,8 @@
-rubpy
+# Pinned: all rubpy calls in this project (login, send, automation, secretary,
+# channel info/views, profile, chats-updates) were verified against 7.3.5.
+# Pinning keeps a freshly provisioned worker on the SAME version as the master
+# (an auto-upgrade could change method signatures and break things).
+rubpy==7.3.5
 telethon==1.36.0
 python-dotenv==1.0.1
 # Optional but recommended for faster Telethon encryption:

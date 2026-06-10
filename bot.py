@@ -31,6 +31,8 @@ import crypto_util
 import db
 import rubika_client as rb
 import worker
+import account_conn
+import features
 
 # Make sure the data dir exists BEFORE the Telethon session file is created.
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
@@ -88,6 +90,10 @@ stop_flags: dict = {}
 active_jobs: set = set()
 # running LOCAL automation tasks: account_id -> {"task":Task, "state":dict}
 automation_tasks: dict = {}
+# running LOCAL automation-EXTRAS tasks: account_id -> {"task":Task, "state":dict}
+secretary_tasks: dict = {}
+reply_tasks: dict = {}
+channelreport_tasks: dict = {}
 
 
 def _alert_word(n: int) -> str:
@@ -111,6 +117,36 @@ def automation_on(account_id: int) -> bool:
         return bool(db.get_automation(account_id).get("enabled"))
     except Exception:
         return False
+
+
+def secretary_on(account_id: int) -> bool:
+    try:
+        return bool(db.get_secretary(account_id).get("enabled"))
+    except Exception:
+        return False
+
+
+def channelreport_on(account_id: int) -> bool:
+    try:
+        return bool(db.get_channel_report(account_id).get("enabled"))
+    except Exception:
+        return False
+
+
+def reply_on(account_id: int) -> bool:
+    try:
+        return bool(db.get_reply_responder(account_id).get("enabled"))
+    except Exception:
+        return False
+
+
+def continuous_busy(account_id: int) -> bool:
+    """True if ANY always-on feature (automation / secretary / channel report /
+    reply responder) is active on the account. One-shot manual operations
+    (send / channel / join) are blocked while this is True, so a one-shot never
+    opens a second connection alongside the shared one (Feature 6)."""
+    return (automation_on(account_id) or secretary_on(account_id)
+            or channelreport_on(account_id) or reply_on(account_id))
 
 
 def _pick_text(texts: list, last_idx):
@@ -146,6 +182,40 @@ async def log(text: str):
         await bot.send_message(config.LOG_GROUP_ID, text)
     except Exception as e:  # noqa: BLE001
         print(f"[log error] {e}")
+
+
+async def _log_invalid_auth(phone: str):
+    """Log that an account's session is truly invalid (device kicked out / login
+    revoked) AFTER a fresh-connection retry already failed. Per the owner this is
+    expected, not a bug. Marks the account inactive so the panel shows a
+    one-tap re-login button, and tells the user how to recover it."""
+    try:
+        for a in db.list_accounts():
+            if rb.normalize_phone(a["phone"]) == rb.normalize_phone(phone):
+                db.set_status(a["id"], "inactive")
+                break
+    except Exception:
+        pass
+    rows = [
+        f"👤 Account : {phone}",
+        "📵 این سشن از روبیکا بیرون انداخته شده (دیوایس logout شده).",
+        "همه‌ی قابلیت‌های این اکانت موقتاً متوقف شدن.",
+        "🔁 برای ریکاوری: «👤 اکانت‌های من» → همین اکانت → «🔁 لاگین مجدد».",
+        f"🕒 {now()}",
+    ]
+    await log(card("🔐 INVALID_AUTH — نیاز به لاگین مجدد", rows))
+
+
+async def _on_invalid_auth(phone: str):
+    """account_conn handler: only MARK the account inactive (the feature loops
+    do the logging when they catch InvalidAuthError, so we don't double-post)."""
+    try:
+        for a in db.list_accounts():
+            if rb.normalize_phone(a["phone"]) == rb.normalize_phone(phone):
+                db.set_status(a["id"], "inactive")
+                break
+    except Exception:
+        pass
 
 
 async def safe_edit(obj, *args, **kwargs):
@@ -260,14 +330,18 @@ async def account_menu_cb(event):
     if not acc:
         await event.answer("اکانت پیدا نشد.", alert=True)
         return
-    status = "فعال ✅" if acc["status"] == "active" else "غیرفعال ⚠️"
+    status = "فعال ✅" if acc["status"] == "active" else "غیرفعال ⚠️ (سشن باطل)"
     text = card("👤 اکانت", [
         f"📛 نام : {acc['name'] or '-'}",
         f"📱 شماره : {acc['phone']}",
         f"🆔 آیدی : {acc['user_id']}",
         f"⭐️ وضعیت : {status}",
     ])
-    buttons = [
+    buttons = []
+    if acc["status"] != "active":
+        buttons.append([Button.inline("🔁 لاگین مجدد (ریکاوری سشن)",
+                                      f"relogin_{account_id}".encode())])
+    buttons += [
         [Button.inline("🚀 ارسال", f"send_{account_id}".encode()),
          Button.inline("📢 کانال", f"chan_{account_id}".encode())],
         [Button.inline("🗑 حذف اکانت", f"del_{account_id}".encode())],
@@ -296,6 +370,71 @@ async def delete_do_cb(event):
     db.delete_account(account_id)
     await safe_edit(event, "اکانت حذف شد. ✅",
                      buttons=[[Button.inline("🔙 بازگشت", b"accounts")]])
+
+
+@bot.on(events.CallbackQuery(pattern=b"relogin_(\\d+)"))
+async def relogin_cb(event):
+    """Re-login an account whose session was invalidated (device kicked out).
+    Reuses the normal login flow; on success its active features auto-recover."""
+    if not is_owner(event):
+        return
+    account_id = int(event.pattern_match.group(1))
+    acc = db.get_account(account_id)
+    if not acc:
+        await event.answer("اکانت پیدا نشد.", alert=True)
+        return
+    phone = acc["phone"]
+    await safe_edit(event, "⏳ در حال آماده‌سازی لاگین مجدد ...")
+    w = worker.worker_for_account(acc) or worker.ensure_master_worker()
+    if w and not worker.is_local(w):
+        # health-check the owning worker first, like the normal remote login
+        try:
+            await worker.check_worker(w)
+        except Exception:
+            pass
+        w = db.get_worker(w["id"])
+        if not (w and w["enabled"] and w["status"] == "ok"):
+            await safe_edit(event,
+                "❌ ورکر این اکانت الان سالم نیست. اول وضعیت ورکر رو درست کن.",
+                buttons=[[Button.inline("🔙 بازگشت", f"acc_{account_id}".encode())]])
+            return
+        await handle_phone_remote(event, phone, w)
+    else:
+        await _begin_local_login(event, phone, w)
+
+
+async def _recover_account_features(account_id: int):
+    """After a (re)login, relaunch every always-on feature that is still marked
+    enabled for this account, so recovery is automatic."""
+    acc = db.get_account(account_id)
+    if not acc:
+        return
+    if automation_on(account_id):
+        try:
+            await start_automation(acc)
+        except Exception as e:  # noqa: BLE001
+            await log(f"⚠️ ریکاوری اتومیشن {acc['phone']} ناموفق: {repr(e)[:120]}")
+    if secretary_on(account_id):
+        try:
+            await start_secretary(acc)
+        except Exception as e:  # noqa: BLE001
+            await log(f"⚠️ ریکاوری منشی {acc['phone']} ناموفق: {repr(e)[:120]}")
+    if channelreport_on(account_id):
+        try:
+            await start_channelreport(acc)
+        except Exception as e:  # noqa: BLE001
+            await log(f"⚠️ ریکاوری گزارش‌کانال {acc['phone']} ناموفق: {repr(e)[:120]}")
+    if reply_on(account_id):
+        try:
+            await start_reply(acc)
+        except Exception as e:  # noqa: BLE001
+            await log(f"⚠️ ریکاوری ریپلای {acc['phone']} ناموفق: {repr(e)[:120]}")
+    if automation_on(account_id) or secretary_on(account_id) or \
+            channelreport_on(account_id) or reply_on(account_id):
+        await log(card("♻️ FEATURES RECOVERED", [
+            f"👤 Account : {acc['phone']}",
+            "قابلیت‌های فعالِ این اکانت بعد از لاگین مجدد دوباره راه افتادن.",
+            f"🕒 {now()}"]))
 
 
 # --------------------------------------------------------------------------- #
@@ -491,6 +630,20 @@ async def message_router(event):
         await handle_auto_link(event)
     elif step == "await_admin_id":
         await handle_admin_id(event)
+    elif step == "await_sec_text":
+        await handle_sec_text(event)
+    elif step == "await_sec_interval":
+        await handle_sec_interval(event)
+    elif step == "await_cr_channel":
+        await handle_cr_channel(event)
+    elif step == "await_cr_interval":
+        await handle_cr_interval(event)
+    elif step == "await_rp_text":
+        await handle_rp_text(event)
+    elif step == "await_rp_delay":
+        await handle_rp_delay(event)
+    elif step == "await_psync":
+        await handle_psync_input(event)
     elif step in ("wk_ip", "wk_port", "wk_user", "wk_pass"):
         await handle_worker_step(event, step)
 
@@ -520,7 +673,17 @@ async def handle_phone(event):
     if not worker.is_local(w):
         await handle_phone_remote(event, phone, w)
         return
+    await _begin_local_login(event, phone, w)
 
+
+async def _begin_local_login(event, phone, w):
+    """Local (master) login flow — shared by first-time add AND re-login."""
+    # closing any warm connection guarantees the fresh login isn't fighting an
+    # old socket for the same session (Feature 6).
+    try:
+        await account_conn.close(phone)
+    except Exception:
+        pass
     # ----- LOCAL master worker: ORIGINAL login logic, unchanged -------------
     try:
         ctx = await rb.start_login(phone)
@@ -607,6 +770,14 @@ async def complete_account(event):
         if w.get("id"):
             db.set_account_worker(account_id, w["id"])
 
+        # re-login recovery: a fresh session is in place now -> clear the
+        # invalid flag and relaunch any always-on feature this account had.
+        try:
+            account_conn.reset_invalid(phone)
+            await _recover_account_features(account_id)
+        except Exception:
+            pass
+
         await log(card("LOGIN SUCCESS ✅", [
             f"This Account : {phone}",
             LINE,
@@ -648,9 +819,10 @@ async def send_prepare_cb(event):
     if not acc:
         await event.answer("اکانت پیدا نشد.", alert=True)
         return
-    if automation_on(account_id):
+    if continuous_busy(account_id):
         await safe_edit(event,
-            "🔁 اتومیشن این اکانت روشنه. اول از بخش «🔁 اتومیشن» خاموشش کن، بعد ارسال بزن.",
+            "🔁 یک قابلیت اتومیشن (اتومیشن/منشی/ریپلای/گزارش) روی این اکانت روشنه. "
+            "اول از بخش «🔁 اتومیشن» خاموشش کن، بعد ارسال بزن.",
             buttons=[[Button.inline("🔙 بازگشت", f"acc_{account_id}".encode())]])
         return
     marker = db.get_marker()
@@ -661,6 +833,7 @@ async def send_prepare_cb(event):
         return
     await safe_edit(event, "⏳ در حال آماده‌سازی (اتصال، پیدا کردن پیام نشان‌دار، خواندن مخاطب‌ها) ...")
 
+    await account_conn.close(acc["phone"])   # ensure single connection (Feature 6)
     client = rb.open_client(acc["phone"])
     try:
         await rb.connect_ready(client)
@@ -772,6 +945,7 @@ async def run_send(owner_id: int, payload: dict):
     n = total
     idx = 0
     retry_count = 0
+    await account_conn.close(phone)          # ensure single connection (Feature 6)
     client = rb.open_client(phone)
     try:
         await rb.connect_ready(client)
@@ -882,8 +1056,9 @@ async def channel_start_cb(event):
     if not acc:
         await event.answer("اکانت پیدا نشد.", alert=True)
         return
-    if automation_on(account_id):
-        await event.answer("🔁 اتومیشن این اکانت روشنه. اول خاموشش کن.", alert=True)
+    if continuous_busy(account_id):
+        await event.answer("🔁 یک قابلیت اتومیشن روی این اکانت روشنه. اول خاموشش کن.",
+                           alert=True)
         return
     state[event.sender_id] = {"step": "await_channel_name", "account_id": account_id}
     await safe_edit(event, 
@@ -933,6 +1108,7 @@ def _channel_ready_card(name, marker, forwarded):
 
 async def channel_create_local(event, acc, name, marker):
     msg = await event.respond(f"⏳ در حال ساخت کانال «{name}» و ارسال فایل نشان‌دار ...")
+    await account_conn.close(acc["phone"])   # ensure single connection (Feature 6)
     client = rb.open_client(acc["phone"])
     channel_guid = None
     forwarded = False
@@ -1036,6 +1212,7 @@ async def run_channel_add_local(owner_id: int, payload: dict):
     name = payload["channel_name"]
     channel_guid = payload["channel_guid"]
     added = 0
+    await account_conn.close(phone)          # ensure single connection (Feature 6)
     client = rb.open_client(phone)
     try:
         await rb.connect_ready(client)
@@ -1158,6 +1335,13 @@ async def complete_account_remote(event, ctx, res):
     # session file lives ON THE WORKER, so store an empty local session path.
     account_id = db.add_account(phone, name, str(guid), "")
     db.set_account_worker(account_id, w["id"])
+
+    # re-login recovery: relaunch any always-on feature this account had.
+    try:
+        account_conn.reset_invalid(phone)
+        await _recover_account_features(account_id)
+    except Exception:
+        pass
 
     await log(card("LOGIN SUCCESS ✅", [
         f"This Account : {phone}",
@@ -1580,9 +1764,10 @@ async def wk_del_do_cb(event):
 # Remote send (account owned by a remote worker)
 # --------------------------------------------------------------------------- #
 async def send_prepare_remote(event, acc, w, marker):
-    if automation_on(acc["id"]):
+    if continuous_busy(acc["id"]):
         await safe_edit(event,
-            "🔁 اتومیشن این اکانت روشنه. اول از بخش «🔁 اتومیشن» خاموشش کن، بعد ارسال بزن.",
+            "🔁 یک قابلیت اتومیشن (اتومیشن/منشی/ریپلای/گزارش) روی این اکانت روشنه. "
+            "اول از بخش «🔁 اتومیشن» خاموشش کن، بعد ارسال بزن.",
             buttons=[[Button.inline("🔙 بازگشت", f"acc_{acc['id']}".encode())]])
         return
     await safe_edit(event, f"⏳ بررسی ورکر {w['tag']} و آماده‌سازی ...")
@@ -1770,6 +1955,7 @@ async def automation_menu_cb(event):
         on = automation_on(a["id"])
         rows.append([Button.inline(f"{'🟢' if on else '⚪️'} {a['phone']}",
                                    f"auto_{a['id']}".encode())])
+    rows.append([Button.inline("🪪 سینک اسم/بیو همه اکانت‌ها", b"psync")])
     rows.append([Button.inline("🔙 بازگشت", b"home")])
     await safe_edit(event, "🔁 اتومیشن — یک اکانت انتخاب کن:", buttons=rows)
 
@@ -1793,6 +1979,10 @@ async def automation_account_cb(event):
         f"فاصله : {au['interval_sec']} ثانیه",
         f"تعداد متن‌ها : {len(texts)}",
         f"مجموع ارسال : {au['sent_total']}",
+        LINE,
+        f"🤖 منشی : {'🟢' if secretary_on(account_id) else '⚪️'}   "
+        f"📊 گزارش کانال : {'🟢' if channelreport_on(account_id) else '⚪️'}   "
+        f"↩️ ریپلای : {'🟢' if reply_on(account_id) else '⚪️'}",
     ]
     rows = [
         [Button.inline("➕ افزودن متن", f"auadd_{account_id}".encode()),
@@ -1801,6 +1991,9 @@ async def automation_account_cb(event):
         [Button.inline("⏱ تنظیم فاصله", f"auint_{account_id}".encode())],
         [Button.inline("⏹ خاموش‌کردن" if on else "▶️ روشن‌کردن",
                        f"autog_{account_id}".encode())],
+        [Button.inline("🤖 منشی پیوی", f"secm_{account_id}".encode()),
+         Button.inline("📊 گزارش کانال", f"crm_{account_id}".encode())],
+        [Button.inline("↩️ پاسخ‌گوی ریپلای", f"rpm_{account_id}".encode())],
         [Button.inline("🔙 بازگشت", b"automation")],
     ]
     await safe_edit(event, "\n".join(lines), buttons=rows)
@@ -1930,7 +2123,9 @@ async def automation_links_cb(event):
     rows = [
         [Button.inline("➕ افزودن لینک", f"auladd_{account_id}".encode()),
          Button.inline("🗑 پاک‌کردن", f"aulclr_{account_id}".encode())],
-        [Button.inline("✅ عضو شو", f"auljoin_{account_id}".encode())],
+        [Button.inline("✅ عضو شو (و ذخیره در لیست مشترک)", f"auljoin_{account_id}".encode())],
+        [Button.inline(f"📥 عضو از لیست مشترک ({db.count_verified_group_links()})",
+                       f"aushared_{account_id}".encode())],
         [Button.inline("🔙 بازگشت", f"auto_{account_id}".encode())],
     ]
     await safe_edit(event, "\n".join(lines), buttons=rows)
@@ -1985,8 +2180,8 @@ async def automation_link_join_cb(event):
     if not links:
         await event.answer("اول حداقل یه لینک اضافه کن.", alert=True)
         return
-    if automation_on(account_id):
-        await event.answer("اتومیشن این اکانت روشنه. اول خاموشش کن، بعد «عضو شو» بزن.",
+    if continuous_busy(account_id):
+        await event.answer("🔁 یک قابلیت اتومیشن روی این اکانت روشنه. اول خاموشش کن، بعد «عضو شو» بزن.",
                            alert=True)
         return
     if account_id in active_jobs:
@@ -2003,6 +2198,7 @@ async def run_group_join(acc: dict, links: list):
     active_jobs.add(account_id)
     joined = 0
     failed = 0
+    joined_links = []
     try:
         w = worker.worker_for_account(acc)
         if w and not worker.is_local(w):
@@ -2010,7 +2206,9 @@ async def run_group_join(acc: dict, links: list):
                                         {"phone": phone, "links": links}, timeout=600)
             joined = res.get("joined", 0)
             failed = res.get("failed", 0)
+            joined_links = res.get("joined_links", []) or []
         else:
+            await account_conn.close(phone)   # ensure single connection (Feature 6)
             client = rb.open_client(phone)
             try:
                 await rb.connect_ready(client)
@@ -2019,6 +2217,7 @@ async def run_group_join(acc: dict, links: list):
                         await asyncio.wait_for(rb.join_group_by_link(client, link),
                                                timeout=60)
                         joined += 1
+                        joined_links.append(link)
                     except Exception:
                         failed += 1
                     await asyncio.sleep(config.GROUP_JOIN_DELAY)
@@ -2027,6 +2226,13 @@ async def run_group_join(acc: dict, links: list):
                     await client.disconnect()
                 except Exception:
                     pass
+        # Feature 4: remember every successfully joined link in the SHARED
+        # verified list so the other accounts can re-use it.
+        for ln in joined_links:
+            try:
+                db.add_verified_group_link(ln, added_by=phone)
+            except Exception:
+                pass
     except Exception as e:  # noqa: BLE001
         await log(f"⚠️ عضو شدن در گروه‌های «{phone}» ناقص ماند: {repr(e)[:150]}")
     finally:
@@ -2035,33 +2241,30 @@ async def run_group_join(acc: dict, links: list):
         f"👤 Account : {phone}",
         f"✅ Joined : {joined}",
         f"❌ Failed : {failed}",
+        f"💾 Saved to shared : {len(joined_links)}",
         f"🕒 {now()}",
     ]))
 
 
 async def run_automation_local(account_id: int, phone: str, st: dict):
-    """Local automation loop: every interval send a random text to each group
-    (tiny random pause between groups). A group is muted only after 3 failures
-    in a row; if everything gets muted (e.g. a temporary block) we reset and
-    reconnect so the loop can recover instead of going silent. Every network
-    call has a timeout so a single stuck call can't freeze the whole loop."""
+    """Local automation loop — now on the SHARED connection (Feature 6). Every
+    interval send a random text to each group (tiny random pause between
+    groups). A group is muted only after 3 failures in a row; if everything
+    gets muted we reset so the loop can recover. Every rubpy call goes through
+    account_conn (per-account lock + warm connection + auto-reconnect) so the
+    secretary / reply responder / channel report on the SAME account interleave
+    safely instead of opening a second session."""
     fails: dict = {}          # guid -> consecutive failures
     last_text: dict = {}
-    client = None
     try:
         while not st["stop"]:
-            if client is None:
-                client = rb.open_client(phone)
-                await rb.connect_ready(client)
             try:
-                groups = await asyncio.wait_for(rb.get_group_guids(client), timeout=60)
+                groups = await account_conn.call(phone, rb.get_group_guids, timeout=60)
+            except account_conn.InvalidAuthError:
+                await _log_invalid_auth(phone)
+                break
             except Exception:
                 groups = []
-                try:
-                    await client.disconnect()
-                except Exception:
-                    pass
-                client = None
             st["groups"] = len(groups)
             for g in groups:
                 if st["stop"]:
@@ -2073,8 +2276,12 @@ async def run_automation_local(account_id: int, phone: str, st: dict):
                 if txt is None:
                     break
                 try:
-                    await asyncio.wait_for(
-                        rb.send_text(client, guid, txt), timeout=config.SEND_TIMEOUT)
+                    await account_conn.call(phone, rb.send_text, guid, txt,
+                                            timeout=config.SEND_TIMEOUT)
+                except account_conn.InvalidAuthError:
+                    await _log_invalid_auth(phone)
+                    st["stop"] = True
+                    break
                 except Exception:
                     fails[guid] = fails.get(guid, 0) + 1
                     if fails[guid] >= 3:
@@ -2090,28 +2297,17 @@ async def run_automation_local(account_id: int, phone: str, st: dict):
                 await asyncio.sleep(random.uniform(
                     config.AUTOMATION_GROUP_DELAY_MIN,
                     config.AUTOMATION_GROUP_DELAY_MAX))
-            # recovery: if every group ended up muted, reset + reconnect
+            # recovery: if every group ended up muted, reset (the manager will
+            # transparently reconnect on the next call if needed)
             if groups and all(g["guid"] in st["skipped"] for g in groups):
                 st["skipped"].clear()
                 fails.clear()
-                try:
-                    if client:
-                        await client.disconnect()
-                except Exception:
-                    pass
-                client = None
             waited = 0
             while waited < st["interval"] and not st["stop"]:
                 await asyncio.sleep(1)
                 waited += 1
     except Exception as e:  # noqa: BLE001
         await log(f"⚠️ اتومیشن «{phone}» با خطا متوقف شد: {repr(e)[:150]}")
-    finally:
-        try:
-            if client:
-                await client.disconnect()
-        except Exception:
-            pass
 
 
 async def start_automation(acc: dict):
@@ -2197,6 +2393,732 @@ async def recover_automations():
 
 
 # --------------------------------------------------------------------------- #
+# Automation EXTRAS — start/stop + panel UI (secretary / channel report /
+# reply responder), profile sync, shared-list join, recovery + worker relay.
+# All LOCAL loops run on the shared connection (account_conn); remote accounts
+# are driven through new worker endpoints (see worker_api.py).
+# --------------------------------------------------------------------------- #
+async def _start_local(tasks: dict, account_id: int, factory):
+    """(Re)start a local feature loop, replacing any previous one."""
+    old = tasks.pop(account_id, None)
+    if old:
+        old["state"]["stop"] = True
+        try:
+            await asyncio.wait_for(old["task"], timeout=5)
+        except Exception:
+            pass
+    st = {"stop": False, "replied": 0}
+    task = asyncio.create_task(factory(st))
+    tasks[account_id] = {"task": task, "state": st}
+
+
+def _stop_local(tasks: dict, account_id: int):
+    t = tasks.pop(account_id, None)
+    if t:
+        t["state"]["stop"] = True
+
+
+# ---- Feature 1: secretary ----
+async def start_secretary(acc: dict):
+    aid = acc["id"]
+    phone = acc["phone"]
+    try:                                   # prime cursor: don't reply to old PVs
+        db.set_secretary_state(aid, "")
+    except Exception:
+        pass
+    sec = db.get_secretary(aid)
+    w = worker.worker_for_account(acc)
+    if w and not worker.is_local(w):
+        await worker.api_call(w, "POST", "/secretary/start", {
+            "phone": phone, "mode": sec.get("mode") or "marker",
+            "text": sec.get("text") or "", "marker": db.get_marker(),
+            "interval": sec.get("interval_sec") or config.SECRETARY_INTERVAL})
+        return
+    await _start_local(secretary_tasks, aid,
+                       lambda st: features.run_secretary_local(aid, phone, st))
+
+
+async def stop_secretary(acc: dict):
+    w = worker.worker_for_account(acc)
+    if w and not worker.is_local(w):
+        try:
+            await worker.api_call(w, "POST", "/secretary/stop", {"phone": acc["phone"]})
+        except Exception:
+            pass
+        return
+    _stop_local(secretary_tasks, acc["id"])
+
+
+# ---- Feature 2: channel report ----
+async def start_channelreport(acc: dict):
+    aid = acc["id"]
+    phone = acc["phone"]
+    cr = db.get_channel_report(aid)
+    w = worker.worker_for_account(acc)
+    if w and not worker.is_local(w):
+        await worker.api_call(w, "POST", "/channelreport/start", {
+            "phone": phone, "channel_guid": cr.get("channel_guid") or "",
+            "channel_title": cr.get("channel_title") or "",
+            "interval": cr.get("interval_sec") or config.CHANNEL_REPORT_INTERVAL})
+        return
+    await _start_local(channelreport_tasks, aid,
+                       lambda st: features.run_channel_report_local(aid, phone, st))
+
+
+async def stop_channelreport(acc: dict):
+    w = worker.worker_for_account(acc)
+    if w and not worker.is_local(w):
+        try:
+            await worker.api_call(w, "POST", "/channelreport/stop", {"phone": acc["phone"]})
+        except Exception:
+            pass
+        return
+    _stop_local(channelreport_tasks, acc["id"])
+
+
+# ---- Feature 5: reply responder ----
+async def start_reply(acc: dict):
+    aid = acc["id"]
+    phone = acc["phone"]
+    rr = db.get_reply_responder(aid)
+    w = worker.worker_for_account(acc)
+    if w and not worker.is_local(w):
+        await worker.api_call(w, "POST", "/reply/start", {
+            "phone": phone, "text": rr.get("text") or "",
+            "delay": rr.get("delay_sec") or config.REPLY_DELAY})
+        return
+    await _start_local(reply_tasks, aid,
+                       lambda st: features.run_reply_local(aid, phone, st))
+
+
+async def stop_reply(acc: dict):
+    w = worker.worker_for_account(acc)
+    if w and not worker.is_local(w):
+        try:
+            await worker.api_call(w, "POST", "/reply/stop", {"phone": acc["phone"]})
+        except Exception:
+            pass
+        return
+    _stop_local(reply_tasks, acc["id"])
+
+
+# --------------------------------------------------------------------------- #
+# Secretary panel
+# --------------------------------------------------------------------------- #
+@bot.on(events.CallbackQuery(pattern=b"secm_(\\d+)"))
+async def secretary_menu_cb(event):
+    if not is_owner(event):
+        return
+    state.pop(event.sender_id, None)
+    aid = int(event.pattern_match.group(1))
+    acc = db.get_account(aid)
+    if not acc:
+        await event.answer("اکانت پیدا نشد.", alert=True)
+        return
+    sec = db.get_secretary(aid)
+    on = bool(sec["enabled"])
+    mode = sec.get("mode") or "marker"
+    lines = [
+        f"🤖 منشی پیوی — {acc['phone']}", LINE,
+        f"وضعیت : {'🟢 روشن' if on else '⚪️ خاموش'}",
+        f"حالت جواب : {'متن دلخواه' if mode == 'text' else 'مارکر (پیام نشان‌دار)'}",
+        f"متن دلخواه : {((sec.get('text') or '—')[:40])}",
+        f"فاصله چک : {sec.get('interval_sec')} ثانیه",
+        f"مجموع جواب‌ها : {sec.get('replied_total')}",
+        LINE,
+        "فقط به «اولین پیامِ» هر نفر جواب داده می‌شه.",
+    ]
+    rows = [
+        [Button.inline("📌 حالت مارکر" + (" ✅" if mode == "marker" else ""),
+                       f"secmodem_{aid}".encode()),
+         Button.inline("✍️ حالت متن" + (" ✅" if mode == "text" else ""),
+                       f"secmodet_{aid}".encode())],
+        [Button.inline("✍️ تنظیم متن دلخواه", f"sectext_{aid}".encode())],
+        [Button.inline("⏱ تنظیم فاصله", f"secint_{aid}".encode())],
+        [Button.inline("⏹ خاموش‌کردن" if on else "▶️ روشن‌کردن",
+                       f"sectog_{aid}".encode())],
+        [Button.inline("🔙 بازگشت", f"auto_{aid}".encode())],
+    ]
+    await safe_edit(event, "\n".join(lines), buttons=rows)
+
+
+@bot.on(events.CallbackQuery(pattern=b"secmodem_(\\d+)"))
+async def secretary_mode_marker_cb(event):
+    if not is_owner(event):
+        return
+    db.set_secretary_mode(int(event.pattern_match.group(1)), "marker")
+    await event.answer("حالت: مارکر")
+    await secretary_menu_cb(event)
+
+
+@bot.on(events.CallbackQuery(pattern=b"secmodet_(\\d+)"))
+async def secretary_mode_text_cb(event):
+    if not is_owner(event):
+        return
+    db.set_secretary_mode(int(event.pattern_match.group(1)), "text")
+    await event.answer("حالت: متن دلخواه")
+    await secretary_menu_cb(event)
+
+
+@bot.on(events.CallbackQuery(pattern=b"sectext_(\\d+)"))
+async def secretary_set_text_cb(event):
+    if not is_owner(event):
+        return
+    aid = int(event.pattern_match.group(1))
+    state[event.sender_id] = {"step": "await_sec_text", "account_id": aid}
+    await safe_edit(event, "✍️ متنِ جوابِ منشی رو بفرست:",
+                    buttons=[[Button.inline("🔙 بازگشت", f"secm_{aid}".encode())]])
+
+
+async def handle_sec_text(event):
+    st = state.get(event.sender_id)
+    if not st:
+        return
+    aid = st["account_id"]
+    txt = event.raw_text.strip()
+    if not txt:
+        await event.respond("متن خالیه. دوباره بفرست.")
+        return
+    db.set_secretary_text(aid, txt)
+    db.set_secretary_mode(aid, "text")
+    state.pop(event.sender_id, None)
+    await event.respond("✅ متن منشی تنظیم شد و حالت روی «متن دلخواه» رفت.",
+                        buttons=[[Button.inline("🔙 بازگشت", f"secm_{aid}".encode())]])
+
+
+@bot.on(events.CallbackQuery(pattern=b"secint_(\\d+)"))
+async def secretary_interval_cb(event):
+    if not is_owner(event):
+        return
+    aid = int(event.pattern_match.group(1))
+    state[event.sender_id] = {"step": "await_sec_interval", "account_id": aid}
+    await safe_edit(event,
+        f"⏱ فاصله‌ی چک پیوی (ثانیه) بین {config.SECRETARY_MIN_INTERVAL} تا "
+        f"{config.SECRETARY_MAX_INTERVAL} بفرست:",
+        buttons=[[Button.inline("🔙 بازگشت", f"secm_{aid}".encode())]])
+
+
+async def handle_sec_interval(event):
+    st = state.get(event.sender_id)
+    if not st:
+        return
+    aid = st["account_id"]
+    db.set_secretary_interval(aid, event.raw_text.strip())
+    state.pop(event.sender_id, None)
+    acc = db.get_account(aid)
+    if acc and secretary_on(aid):          # apply new interval to a live loop
+        await stop_secretary(acc)
+        await start_secretary(acc)
+    iv = db.get_secretary(aid)["interval_sec"]
+    await event.respond(f"✅ فاصله روی {iv} ثانیه تنظیم شد.",
+                        buttons=[[Button.inline("🔙 بازگشت", f"secm_{aid}".encode())]])
+
+
+@bot.on(events.CallbackQuery(pattern=b"sectog_(\\d+)"))
+async def secretary_toggle_cb(event):
+    if not is_owner(event):
+        return
+    aid = int(event.pattern_match.group(1))
+    acc = db.get_account(aid)
+    if not acc:
+        await event.answer("اکانت پیدا نشد.", alert=True)
+        return
+    sec = db.get_secretary(aid)
+    if not sec["enabled"]:
+        if aid in active_jobs:
+            await event.answer("این اکانت الان مشغول یک عملیات تک‌باریه. صبر کن.", alert=True)
+            return
+        if (sec.get("mode") or "marker") == "text" and not (sec.get("text") or "").strip():
+            await event.answer("اول متن دلخواه رو تنظیم کن یا حالت مارکر رو انتخاب کن.",
+                               alert=True)
+            return
+        try:
+            await start_secretary(acc)
+        except Exception as e:  # noqa: BLE001
+            await event.answer(f"شروع منشی ناموفق: {repr(e)[:110]}\n"
+                               "اگه اکانت روی ورکره، اول ورکر رو آپدیت کن.", alert=True)
+            return
+        db.set_secretary_enabled(aid, True)
+        await log(card("🤖 SECRETARY ON", [f"👤 Account : {acc['phone']}", f"🕒 {now()}"]))
+    else:
+        db.set_secretary_enabled(aid, False)
+        await stop_secretary(acc)
+        await log(card("🤖 SECRETARY OFF", [f"👤 Account : {acc['phone']}", f"🕒 {now()}"]))
+    await secretary_menu_cb(event)
+
+
+# --------------------------------------------------------------------------- #
+# Channel report panel
+# --------------------------------------------------------------------------- #
+@bot.on(events.CallbackQuery(pattern=b"crm_(\\d+)"))
+async def channelreport_menu_cb(event):
+    if not is_owner(event):
+        return
+    state.pop(event.sender_id, None)
+    aid = int(event.pattern_match.group(1))
+    acc = db.get_account(aid)
+    if not acc:
+        await event.answer("اکانت پیدا نشد.", alert=True)
+        return
+    cr = db.get_channel_report(aid)
+    on = bool(cr["enabled"])
+    lines = [
+        f"📊 گزارش کانال — {acc['phone']}", LINE,
+        f"وضعیت : {'🟢 روشن' if on else '⚪️ خاموش'}",
+        f"کانال : {cr.get('channel_guid') or '—'}",
+        f"عنوان : {cr.get('channel_title') or '—'}",
+        f"فاصله : {cr.get('interval_sec')} ثانیه",
+        LINE,
+        "هر بازه: تعداد اعضا + بازدید آخرین پست → گروه لاگ.",
+    ]
+    rows = [
+        [Button.inline("📢 تنظیم کانال (لینک/یوزرنیم/گایید)", f"crset_{aid}".encode())],
+        [Button.inline("⏱ تنظیم فاصله", f"crint_{aid}".encode())],
+        [Button.inline("⏹ خاموش‌کردن" if on else "▶️ روشن‌کردن",
+                       f"crtog_{aid}".encode())],
+        [Button.inline("🔙 بازگشت", f"auto_{aid}".encode())],
+    ]
+    await safe_edit(event, "\n".join(lines), buttons=rows)
+
+
+@bot.on(events.CallbackQuery(pattern=b"crset_(\\d+)"))
+async def channelreport_set_cb(event):
+    if not is_owner(event):
+        return
+    aid = int(event.pattern_match.group(1))
+    state[event.sender_id] = {"step": "await_cr_channel", "account_id": aid}
+    await safe_edit(event,
+        "📢 لینک یا یوزرنیم یا گاییدِ کانال رو بفرست:\n"
+        "مثال: `@my_channel` یا `https://rubika.ir/my_channel` یا `c0...`",
+        buttons=[[Button.inline("🔙 بازگشت", f"crm_{aid}".encode())]])
+
+
+async def handle_cr_channel(event):
+    st = state.get(event.sender_id)
+    if not st:
+        return
+    aid = st["account_id"]
+    ref = event.raw_text.strip()
+    if not ref:
+        await event.respond("خالیه. دوباره بفرست.")
+        return
+    db.set_channel_report_target(aid, ref, "")
+    state.pop(event.sender_id, None)
+    await event.respond("✅ کانال ثبت شد. (موقع گزارش، یوزرنیم/لینک خودکار به گایید تبدیل می‌شه)",
+                        buttons=[[Button.inline("🔙 بازگشت", f"crm_{aid}".encode())]])
+
+
+@bot.on(events.CallbackQuery(pattern=b"crint_(\\d+)"))
+async def channelreport_interval_cb(event):
+    if not is_owner(event):
+        return
+    aid = int(event.pattern_match.group(1))
+    state[event.sender_id] = {"step": "await_cr_interval", "account_id": aid}
+    await safe_edit(event,
+        f"⏱ فاصله‌ی گزارش (ثانیه) بین {config.CHANNEL_REPORT_MIN_INTERVAL} تا "
+        f"{config.CHANNEL_REPORT_MAX_INTERVAL} بفرست:",
+        buttons=[[Button.inline("🔙 بازگشت", f"crm_{aid}".encode())]])
+
+
+async def handle_cr_interval(event):
+    st = state.get(event.sender_id)
+    if not st:
+        return
+    aid = st["account_id"]
+    db.set_channel_report_interval(aid, event.raw_text.strip())
+    state.pop(event.sender_id, None)
+    acc = db.get_account(aid)
+    if acc and channelreport_on(aid):
+        await stop_channelreport(acc)
+        await start_channelreport(acc)
+    iv = db.get_channel_report(aid)["interval_sec"]
+    await event.respond(f"✅ فاصله روی {iv} ثانیه تنظیم شد.",
+                        buttons=[[Button.inline("🔙 بازگشت", f"crm_{aid}".encode())]])
+
+
+@bot.on(events.CallbackQuery(pattern=b"crtog_(\\d+)"))
+async def channelreport_toggle_cb(event):
+    if not is_owner(event):
+        return
+    aid = int(event.pattern_match.group(1))
+    acc = db.get_account(aid)
+    if not acc:
+        await event.answer("اکانت پیدا نشد.", alert=True)
+        return
+    cr = db.get_channel_report(aid)
+    if not cr["enabled"]:
+        if aid in active_jobs:
+            await event.answer("این اکانت الان مشغول یک عملیات تک‌باریه. صبر کن.", alert=True)
+            return
+        if not (cr.get("channel_guid") or "").strip():
+            await event.answer("اول کانال رو تنظیم کن.", alert=True)
+            return
+        try:
+            await start_channelreport(acc)
+        except Exception as e:  # noqa: BLE001
+            await event.answer(f"شروع گزارش ناموفق: {repr(e)[:110]}\n"
+                               "اگه اکانت روی ورکره، اول ورکر رو آپدیت کن.", alert=True)
+            return
+        db.set_channel_report_enabled(aid, True)
+        await log(card("📊 CHANNEL REPORT ON", [
+            f"👤 Account : {acc['phone']}",
+            f"🆔 Channel : {cr.get('channel_guid')}",
+            f"🕒 {now()}"]))
+    else:
+        db.set_channel_report_enabled(aid, False)
+        await stop_channelreport(acc)
+        await log(card("📊 CHANNEL REPORT OFF", [f"👤 Account : {acc['phone']}", f"🕒 {now()}"]))
+    await channelreport_menu_cb(event)
+
+
+# --------------------------------------------------------------------------- #
+# Reply responder panel
+# --------------------------------------------------------------------------- #
+@bot.on(events.CallbackQuery(pattern=b"rpm_(\\d+)"))
+async def reply_menu_cb(event):
+    if not is_owner(event):
+        return
+    state.pop(event.sender_id, None)
+    aid = int(event.pattern_match.group(1))
+    acc = db.get_account(aid)
+    if not acc:
+        await event.answer("اکانت پیدا نشد.", alert=True)
+        return
+    rr = db.get_reply_responder(aid)
+    on = bool(rr["enabled"])
+    lines = [
+        f"↩️ پاسخ‌گوی ریپلای — {acc['phone']}", LINE,
+        f"وضعیت : {'🟢 روشن' if on else '⚪️ خاموش'}",
+        f"متن جواب : {((rr.get('text') or '—')[:40])}",
+        f"تأخیر : {rr.get('delay_sec')} ثانیه",
+        f"مجموع جواب‌ها : {rr.get('replied_total')}",
+        LINE,
+        "وقتی توی گروه به این اکانت ریپلای بزنن، جواب خودکار می‌ده (فعلاً فقط متن).",
+    ]
+    rows = [
+        [Button.inline("✍️ تنظیم متن", f"rptext_{aid}".encode())],
+        [Button.inline("⏱ تنظیم تأخیر", f"rpdelay_{aid}".encode())],
+        [Button.inline("⏹ خاموش‌کردن" if on else "▶️ روشن‌کردن",
+                       f"rptog_{aid}".encode())],
+        [Button.inline("🔙 بازگشت", f"auto_{aid}".encode())],
+    ]
+    await safe_edit(event, "\n".join(lines), buttons=rows)
+
+
+@bot.on(events.CallbackQuery(pattern=b"rptext_(\\d+)"))
+async def reply_set_text_cb(event):
+    if not is_owner(event):
+        return
+    aid = int(event.pattern_match.group(1))
+    state[event.sender_id] = {"step": "await_rp_text", "account_id": aid}
+    await safe_edit(event, "✍️ متنِ جوابِ ریپلای رو بفرست:",
+                    buttons=[[Button.inline("🔙 بازگشت", f"rpm_{aid}".encode())]])
+
+
+async def handle_rp_text(event):
+    st = state.get(event.sender_id)
+    if not st:
+        return
+    aid = st["account_id"]
+    txt = event.raw_text.strip()
+    if not txt:
+        await event.respond("متن خالیه. دوباره بفرست.")
+        return
+    db.set_reply_text(aid, txt)
+    state.pop(event.sender_id, None)
+    await event.respond("✅ متن ریپلای تنظیم شد.",
+                        buttons=[[Button.inline("🔙 بازگشت", f"rpm_{aid}".encode())]])
+
+
+@bot.on(events.CallbackQuery(pattern=b"rpdelay_(\\d+)"))
+async def reply_set_delay_cb(event):
+    if not is_owner(event):
+        return
+    aid = int(event.pattern_match.group(1))
+    state[event.sender_id] = {"step": "await_rp_delay", "account_id": aid}
+    await safe_edit(event,
+        f"⏱ تأخیرِ جواب (ثانیه) بین {config.REPLY_MIN_DELAY} تا "
+        f"{config.REPLY_MAX_DELAY} بفرست:",
+        buttons=[[Button.inline("🔙 بازگشت", f"rpm_{aid}".encode())]])
+
+
+async def handle_rp_delay(event):
+    st = state.get(event.sender_id)
+    if not st:
+        return
+    aid = st["account_id"]
+    db.set_reply_delay(aid, event.raw_text.strip())
+    state.pop(event.sender_id, None)
+    acc = db.get_account(aid)
+    if acc and reply_on(aid):
+        await stop_reply(acc)
+        await start_reply(acc)
+    d = db.get_reply_responder(aid)["delay_sec"]
+    await event.respond(f"✅ تأخیر روی {d} ثانیه تنظیم شد.",
+                        buttons=[[Button.inline("🔙 بازگشت", f"rpm_{aid}".encode())]])
+
+
+@bot.on(events.CallbackQuery(pattern=b"rptog_(\\d+)"))
+async def reply_toggle_cb(event):
+    if not is_owner(event):
+        return
+    aid = int(event.pattern_match.group(1))
+    acc = db.get_account(aid)
+    if not acc:
+        await event.answer("اکانت پیدا نشد.", alert=True)
+        return
+    rr = db.get_reply_responder(aid)
+    if not rr["enabled"]:
+        if aid in active_jobs:
+            await event.answer("این اکانت الان مشغول یک عملیات تک‌باریه. صبر کن.", alert=True)
+            return
+        if not (rr.get("text") or "").strip():
+            await event.answer("اول متن جواب رو تنظیم کن.", alert=True)
+            return
+        try:
+            await start_reply(acc)
+        except Exception as e:  # noqa: BLE001
+            await event.answer(f"شروع ریپلای ناموفق: {repr(e)[:110]}\n"
+                               "اگه اکانت روی ورکره، اول ورکر رو آپدیت کن.", alert=True)
+            return
+        db.set_reply_enabled(aid, True)
+        await log(card("↩️ REPLY RESPONDER ON", [f"👤 Account : {acc['phone']}", f"🕒 {now()}"]))
+    else:
+        db.set_reply_enabled(aid, False)
+        await stop_reply(acc)
+        await log(card("↩️ REPLY RESPONDER OFF", [f"👤 Account : {acc['phone']}", f"🕒 {now()}"]))
+    await reply_menu_cb(event)
+
+
+# --------------------------------------------------------------------------- #
+# Feature 3: profile (name + bio) sync across ALL accounts
+# --------------------------------------------------------------------------- #
+@bot.on(events.CallbackQuery(data=b"psync"))
+async def psync_menu_cb(event):
+    if not is_owner(event):
+        return
+    state.pop(event.sender_id, None)
+    p = db.get_profile_sync()
+    name = (str(p.get("first_name") or "") + " " + str(p.get("last_name") or "")).strip()
+    lines = [
+        "🪪 سینک اسم/بیو همه اکانت‌ها", LINE,
+        f"نام : {name or '—'}",
+        f"بیو : {p.get('bio') or '—'}",
+        LINE,
+        "این مقدار روی همه‌ی اکانت‌ها اعمال می‌شه (عکس لازم نیست).",
+    ]
+    rows = [
+        [Button.inline("✏️ تنظیم نام/بیو", b"psyncset")],
+        [Button.inline("🚀 اعمال روی همه", b"psyncgo")],
+        [Button.inline("🔙 بازگشت", b"automation")],
+    ]
+    await safe_edit(event, "\n".join(lines), buttons=rows)
+
+
+@bot.on(events.CallbackQuery(data=b"psyncset"))
+async def psync_set_cb(event):
+    if not is_owner(event):
+        return
+    state[event.sender_id] = {"step": "await_psync"}
+    await safe_edit(event,
+        "✏️ نام رو در خط اول و بیو رو در خط دوم بفرست:\n"
+        "خط اول = نام کامل (با اولین فاصله به نام/نام‌خانوادگی تقسیم می‌شه)\n"
+        "خط دوم = بیو\n\nمثال:\nعلی رضایی\nسلام، خوش اومدی 🌹",
+        buttons=[[Button.inline("🔙 بازگشت", b"psync")]])
+
+
+async def handle_psync_input(event):
+    txt = event.raw_text
+    parts = txt.split("\n", 1)
+    name_line = parts[0].strip()
+    bio = parts[1].strip() if len(parts) > 1 else ""
+    np = name_line.split(" ", 1)
+    first = np[0].strip() if np else ""
+    last = np[1].strip() if len(np) > 1 else ""
+    db.set_profile_sync(first, last, bio)
+    state.pop(event.sender_id, None)
+    await event.respond(
+        f"✅ ثبت شد:\nنام: {name_line or '—'}\nبیو: {bio or '—'}\n"
+        "حالا «🚀 اعمال روی همه» رو بزن.",
+        buttons=[[Button.inline("🔙 بازگشت", b"psync")]])
+
+
+async def _apply_profile_local(client, first, last, bio):
+    """Compare current profile to target; update only if different. Returns
+    True if changed, False if already identical."""
+    cur = await rb.get_my_profile(client)
+    same = ((cur.get("first_name") or "") == first
+            and (cur.get("last_name") or "") == last
+            and (cur.get("bio") or "") == bio)
+    if same:
+        return False
+    await rb.update_profile(client, first_name=first, last_name=last, bio=bio)
+    return True
+
+
+@bot.on(events.CallbackQuery(data=b"psyncgo"))
+async def psync_go_cb(event):
+    if not is_owner(event):
+        return
+    accounts = db.list_accounts()
+    if not accounts:
+        await event.answer("هیچ اکانتی نیست.", alert=True)
+        return
+    p = db.get_profile_sync()
+    if not (p.get("first_name") or p.get("last_name") or p.get("bio")):
+        await event.answer("اول نام/بیو رو تنظیم کن.", alert=True)
+        return
+    await safe_edit(event,
+        f"⏳ در حال اعمال نام/بیو روی {len(accounts)} اکانت ... گزارش در گروه لاگ میاد.")
+    asyncio.create_task(run_profile_sync())
+
+
+async def run_profile_sync():
+    p = db.get_profile_sync()
+    first = p.get("first_name") or ""
+    last = p.get("last_name") or ""
+    bio = p.get("bio") or ""
+    accounts = db.list_accounts()
+    changed = unchanged = failed = 0
+    rows = []
+    for acc in accounts:
+        phone = acc["phone"]
+        try:
+            w = worker.worker_for_account(acc)
+            if w and not worker.is_local(w):
+                res = await worker.api_call(w, "POST", "/profile/update", {
+                    "phone": phone, "first_name": first, "last_name": last,
+                    "bio": bio}, timeout=120)
+                ch = res.get("changed")
+            else:
+                ch = await account_conn.call(phone, _apply_profile_local,
+                                             first, last, bio, timeout=60)
+            if ch:
+                changed += 1
+                rows.append(f"• {phone} : ✅ عوض شد")
+            else:
+                unchanged += 1
+                rows.append(f"• {phone} : ⏸ بدون تغییر")
+        except account_conn.InvalidAuthError:
+            failed += 1
+            rows.append(f"• {phone} : 🔐 سشن باطل (لاگین مجدد)")
+        except Exception as e:  # noqa: BLE001
+            failed += 1
+            rows.append(f"• {phone} : ❌ {repr(e)[:60]}")
+        await asyncio.sleep(config.PROFILE_SYNC_DELAY)
+    await log(card("🪪 PROFILE SYNC", [
+        f"✅ تغییر: {changed}   ⏸ بدون تغییر: {unchanged}   ❌ خطا: {failed}",
+        LINE, *rows, LINE, f"🕒 {now()}"]))
+    try:
+        await bot.send_message(config.OWNER_ID,
+                               f"🪪 سینک پروفایل تمام شد. ✅ {changed} / ⏸ {unchanged} / ❌ {failed}",
+                               buttons=main_menu(True))
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------------- #
+# Feature 4: a single account joins the SHARED verified group-link list.
+# --------------------------------------------------------------------------- #
+@bot.on(events.CallbackQuery(pattern=b"aushared_(\\d+)"))
+async def automation_shared_join_cb(event):
+    if not is_owner(event):
+        return
+    aid = int(event.pattern_match.group(1))
+    acc = db.get_account(aid)
+    if not acc:
+        await event.answer("اکانت پیدا نشد.", alert=True)
+        return
+    links = db.list_verified_group_links()
+    if not links:
+        await event.answer("لیست مشترک خالیه. اول با یک اکانت «عضو شو» بزن تا پر شه.",
+                           alert=True)
+        return
+    if continuous_busy(aid):
+        await event.answer("یک قابلیت اتومیشن روی این اکانت روشنه. اول خاموشش کن.", alert=True)
+        return
+    if aid in active_jobs:
+        await event.answer("این اکانت مشغوله. صبر کن.", alert=True)
+        return
+    await safe_edit(event,
+        f"⏳ {acc['phone']} داره از لیست مشترک ({len(links)}) عضو می‌شه ... "
+        "گزارش در گروه لاگ میاد.")
+    asyncio.create_task(run_group_join(acc, links))
+
+
+# --------------------------------------------------------------------------- #
+# Recovery (on boot) + worker relay loop for the EXTRAS.
+# --------------------------------------------------------------------------- #
+async def recover_extras():
+    """Relaunch every EXTRA feature that was enabled before a restart."""
+    for sec in db.list_enabled_secretaries():
+        acc = db.get_account(sec["account_id"])
+        if acc:
+            try:
+                await start_secretary(acc)
+            except Exception as e:  # noqa: BLE001
+                await log(f"⚠️ بازگردانی منشی {acc['phone']} ناموفق: {repr(e)[:120]}")
+    for cr in db.list_enabled_channel_reports():
+        acc = db.get_account(cr["account_id"])
+        if acc:
+            try:
+                await start_channelreport(acc)
+            except Exception as e:  # noqa: BLE001
+                await log(f"⚠️ بازگردانی گزارش‌کانال {acc['phone']} ناموفق: {repr(e)[:120]}")
+    for rr in db.list_enabled_reply_responders():
+        acc = db.get_account(rr["account_id"])
+        if acc:
+            try:
+                await start_reply(acc)
+            except Exception as e:  # noqa: BLE001
+                await log(f"⚠️ بازگردانی ریپلای {acc['phone']} ناموفق: {repr(e)[:120]}")
+
+
+async def _heal_remote_extra(acc, status_path, starter):
+    w = worker.worker_for_account(acc)
+    if not (w and not worker.is_local(w)):
+        return
+    try:
+        stt = await worker.api_call(w, "GET", f"{status_path}?phone={acc['phone']}")
+        if not stt.get("running"):           # worker container restarted
+            await starter(acc)
+    except Exception:
+        pass
+
+
+async def extras_worker_loop():
+    """Every 30s: drain queued log lines from each remote worker (so worker-side
+    secretary/reply/report events show up in the master log group), and relaunch
+    any remote EXTRA whose worker restarted."""
+    while True:
+        await asyncio.sleep(30)
+        try:
+            for w in db.list_enabled_workers():
+                if worker.is_local(w):
+                    continue
+                try:
+                    res = await worker.api_call(w, "GET", "/extras/logs", timeout=30)
+                    for line in (res.get("logs") or []):
+                        await log(line)
+                except Exception:
+                    pass
+            for sec in db.list_enabled_secretaries():
+                acc = db.get_account(sec["account_id"])
+                if acc:
+                    await _heal_remote_extra(acc, "/secretary/status", start_secretary)
+            for cr in db.list_enabled_channel_reports():
+                acc = db.get_account(cr["account_id"])
+                if acc:
+                    await _heal_remote_extra(acc, "/channelreport/status", start_channelreport)
+            for rr in db.list_enabled_reply_responders():
+                acc = db.get_account(rr["account_id"])
+                if acc:
+                    await _heal_remote_extra(acc, "/reply/status", start_reply)
+        except Exception as e:  # noqa: BLE001
+            print(f"[extras_worker_loop] {e}")
+
+
+# --------------------------------------------------------------------------- #
 # Background health monitor: immediate alerts + periodic STATU WORKER ALL.
 # --------------------------------------------------------------------------- #
 async def health_loop():
@@ -2238,6 +3160,10 @@ async def amain():
         return
     db.init()
     worker.ensure_master_worker()
+    # Feature 6 wiring: shared-connection logger + invalid-auth handler + janitor
+    features.set_logger(log)
+    account_conn.set_invalid_auth_handler(_on_invalid_auth)
+    account_conn.start_janitor()
     await bot.start(bot_token=config.BOT_TOKEN)
     await log(card("Online", [f"Rubika Project {config.VERSION}", LINE, f"🕒 {now()}"]))
     print(f"Panel is running (version {config.VERSION}).")
@@ -2246,9 +3172,16 @@ async def amain():
     # automation: periodic summary log + relaunch any automation enabled before restart
     asyncio.create_task(automation_summary_loop())
     await recover_automations()
+    # automation EXTRAS: relaunch enabled features + drain remote worker logs/heal
+    asyncio.create_task(extras_worker_loop())
+    await recover_extras()
     try:
         await bot.run_until_disconnected()
     finally:
+        try:
+            await account_conn.close_all()
+        except Exception:
+            pass
         await worker.shutdown()
 
 

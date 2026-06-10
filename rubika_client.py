@@ -642,3 +642,293 @@ async def join_group_by_link(client: Client, link: str):
                     last_err = e
                     break
     raise RuntimeError(f"could not join via link: {last_err}")
+
+
+
+# =========================================================================== #
+# ADDITIVE helpers for the automation EXTRAS (secretary / channel report /
+# profile sync / reply responder). These DO NOT change any existing function;
+# they only add new, version-tolerant wrappers around rubpy 7.3.5 methods that
+# were verified on the owner's account:
+#   update_profile(first_name, last_name, bio)
+#   get_channel_info(channel_guid)            -> channel.count_members
+#   get_messages(object_guid, max_id, limit)  -> message.count_seen (views)
+#   get_chats_updates(state)                  -> chats + new_state
+# =========================================================================== #
+def _find_first_key(obj, needles, _depth=0):
+    """Recursively return the first scalar value whose key name contains any of
+    `needles` (case-insensitive). Used as a defensive fallback when a field is
+    nested differently across rubpy versions."""
+    if _depth > 6:
+        return None
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if (any(n in str(k).lower() for n in needles)
+                    and not isinstance(v, (dict, list))):
+                return v
+        for v in obj.values():
+            r = _find_first_key(v, needles, _depth + 1)
+            if r is not None:
+                return r
+    elif isinstance(obj, list):
+        for v in obj:
+            r = _find_first_key(v, needles, _depth + 1)
+            if r is not None:
+                return r
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# Feature 3: profile (name + bio) — read current + update.
+# --------------------------------------------------------------------------- #
+async def get_my_profile(client: Client) -> dict:
+    """Return the account's current {first_name, last_name, bio}."""
+    me = await client.get_me()
+    d = _data_of(me)
+    u = d.get("user") if isinstance(d.get("user"), dict) else d
+    return {
+        "first_name": (u.get("first_name") or "") if isinstance(u, dict) else "",
+        "last_name": (u.get("last_name") or "") if isinstance(u, dict) else "",
+        "bio": (u.get("bio") or "") if isinstance(u, dict) else "",
+    }
+
+
+async def update_profile(client: Client, first_name=None, last_name=None, bio=None):
+    """Update name/bio. Verified shape: update_profile(first_name, last_name, bio).
+    Only sends the fields that are not None; tolerant of small signature diffs."""
+    fn = getattr(client, "update_profile", None)
+    if fn is None:
+        raise RuntimeError("this rubpy build has no update_profile()")
+    kwargs = {}
+    if first_name is not None:
+        kwargs["first_name"] = first_name
+    if last_name is not None:
+        kwargs["last_name"] = last_name
+    if bio is not None:
+        kwargs["bio"] = bio
+    try:
+        return await fn(**kwargs)
+    except TypeError:
+        # positional fallback (first_name, last_name, bio)
+        return await fn(first_name or "", last_name or "", bio if bio is not None else "")
+
+
+# --------------------------------------------------------------------------- #
+# Feature 2: channel info (member count) + last post views, + resolve a
+# link/@username/guid into a channel guid.
+# --------------------------------------------------------------------------- #
+async def get_channel_info(client: Client, channel_guid: str):
+    fn = getattr(client, "get_channel_info", None)
+    if fn is None:
+        raise RuntimeError("this rubpy build has no get_channel_info()")
+    return await _try_call(fn, [
+        lambda: ((channel_guid,), {}),
+        lambda: ((), {"channel_guid": channel_guid}),
+        lambda: ((), {"object_guid": channel_guid}),
+    ])
+
+
+def channel_member_count(info) -> int:
+    """Member count from get_channel_info(). Verified field: channel.count_members."""
+    d = _data_of(info)
+    ch = d.get("channel") if isinstance(d.get("channel"), dict) else d
+    for key in ("count_members", "member_count", "members_count", "subscriber_count"):
+        if isinstance(ch, dict) and ch.get(key) is not None:
+            try:
+                return int(ch[key])
+            except (TypeError, ValueError):
+                return ch[key]
+    v = _find_first_key(d, ("member", "subscriber"))
+    try:
+        return int(v) if v is not None else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def channel_title_of(info) -> str:
+    d = _data_of(info)
+    ch = d.get("channel") if isinstance(d.get("channel"), dict) else d
+    if isinstance(ch, dict):
+        return ch.get("channel_title") or ch.get("title") or ""
+    return ""
+
+
+async def resolve_channel(client: Client, ref: str):
+    """Turn a guid / @username / link into (channel_guid, channel_title).
+    Raises if it cannot be resolved."""
+    ref = (ref or "").strip()
+    if ref.startswith("c0"):
+        return ref, ""
+    if ref.startswith("@"):
+        username = ref[1:]
+    elif ref.startswith("http"):
+        username = ref.rstrip("/").split("/")[-1].lstrip("@")
+    else:
+        username = ref.lstrip("@")
+    for name in ("get_object_by_username", "get_info_by_username",
+                 "get_channel_info_by_username"):
+        fn = getattr(client, name, None)
+        if fn is None:
+            continue
+        try:
+            res = await _try_call(fn, [
+                lambda u=username: ((u,), {}),
+                lambda u=username: ((), {"username": u}),
+            ])
+        except Exception:
+            continue
+        d = _data_of(res)
+        ch = d.get("channel") if isinstance(d.get("channel"), dict) else {}
+        guid = (ch.get("channel_guid") if isinstance(ch, dict) else None) \
+            or _channel_guid_of(res) or _guid_of(res)
+        title = (ch.get("channel_title") if isinstance(ch, dict) else "") or ""
+        if guid:
+            return guid, title
+    raise RuntimeError("could not resolve channel (use the channel guid 'c0...')")
+
+
+async def get_last_post_views(client: Client, channel_guid: str):
+    """Return (views, message_id) for the channel's newest post. Verified field:
+    message.count_seen. Falls back to a recursive search, then (None, mid)."""
+    result = await client.get_messages(channel_guid, "0", "1")
+    messages = getattr(result, "messages", None)
+    if messages is None and isinstance(result, dict):
+        messages = result.get("messages", [])
+    if not messages:
+        return None, None
+    m = messages[0]
+    md = _data_of(m)
+    mid = _msg_id_of(m)
+    for key in ("count_seen", "views", "view_count", "count_views", "seen_count"):
+        if md.get(key) is not None:
+            return md.get(key), mid
+    v = _find_first_key(md, ("seen", "view"))
+    return v, mid
+
+
+# --------------------------------------------------------------------------- #
+# Feature 1 & 5: chat updates polling (new PVs / new group messages).
+# --------------------------------------------------------------------------- #
+async def get_chats_updates(client: Client, state):
+    """Call get_chats_updates(state). rubpy expects an INTEGER state (unix
+    seconds). An empty/None/0 state means 'first run': we pass nothing and let
+    rubpy default it (it uses ~now-200s, so we don't pull the whole history).
+    Passing '' directly makes rubpy run int('') and crash, so we coerce here."""
+    fn = getattr(client, "get_chats_updates", None)
+    if fn is None:
+        raise RuntimeError("this rubpy build has no get_chats_updates()")
+    s = None
+    if state not in (None, "", "0", 0):
+        try:
+            s = int(state)
+        except (TypeError, ValueError):
+            s = None
+    try:
+        return await fn() if s is None else await fn(s)
+    except TypeError:
+        try:
+            return await fn(state=s) if s is not None else await fn()
+        except TypeError:
+            return await fn()
+
+
+def parse_chats_updates(result):
+    """Return (chats: list, new_state: str|None) from a get_chats_updates() result."""
+    d = _data_of(result)
+    chats = None
+    for key in ("chats", "chats_updates", "updated_chats", "chat_updates"):
+        v = d.get(key)
+        if isinstance(v, list):
+            chats = v
+            break
+    new_state = (d.get("new_state") or d.get("state") or d.get("next_state")
+                 or d.get("timestamp"))
+    return (chats or []), new_state
+
+
+def chat_object_guid(chat):
+    d = _data_of(chat)
+    return d.get("object_guid") or _guid_of(chat)
+
+
+def chat_type(chat) -> str:
+    """Lower-case chat type ('user' / 'group' / 'channel' / ...)."""
+    return _type_of(chat)
+
+
+def chat_last_message(chat) -> dict:
+    d = _data_of(chat)
+    lm = d.get("last_message")
+    return lm if isinstance(lm, dict) else {}
+
+
+def chat_last_message_id(chat):
+    d = _data_of(chat)
+    return d.get("last_message_id") or chat_last_message(chat).get("message_id")
+
+
+def message_author_guid(msg) -> str:
+    d = _data_of(msg)
+    for key in ("author_object_guid", "author_guid", "author_object_id"):
+        if d.get(key):
+            return d[key]
+    a = d.get("author")
+    if isinstance(a, dict):
+        return a.get("object_guid") or a.get("guid") or ""
+    return ""
+
+
+def message_reply_to_id(msg):
+    d = _data_of(msg)
+    return d.get("reply_to_message_id") or d.get("reply_to_object")
+
+
+# --------------------------------------------------------------------------- #
+# Feature 5 helpers: read recent messages, fetch a message by id, send a reply.
+# --------------------------------------------------------------------------- #
+async def get_recent_messages(client: Client, object_guid: str, limit: int = 20) -> list:
+    """Return up to `limit` recent messages of a chat (newest first)."""
+    result = await client.get_messages(object_guid, "0", str(limit))
+    messages = getattr(result, "messages", None)
+    if messages is None and isinstance(result, dict):
+        messages = result.get("messages", [])
+    return messages or []
+
+
+async def get_messages_by_id(client: Client, object_guid: str, message_ids: list):
+    """Fetch specific messages by id (tolerant). Returns a list of messages or []"""
+    for name in ("get_messages_by_id", "get_message_by_id", "get_messages_by_ID"):
+        fn = getattr(client, name, None)
+        if fn is None:
+            continue
+        try:
+            res = await _try_call(fn, [
+                lambda: ((object_guid, message_ids), {}),
+                lambda: ((), {"object_guid": object_guid, "message_ids": message_ids}),
+            ])
+        except Exception:
+            continue
+        messages = getattr(res, "messages", None)
+        if messages is None and isinstance(res, dict):
+            messages = res.get("messages", [])
+        return messages or []
+    return []
+
+
+async def send_reply(client: Client, object_guid: str, text: str, reply_to_message_id):
+    """Send a text message as a reply to a specific message. Tolerant of diffs."""
+    fn = getattr(client, "send_message", None)
+    if fn is None:
+        raise RuntimeError("this rubpy build has no send_message()")
+    return await _try_call(fn, [
+        lambda: ((), {"object_guid": object_guid, "text": text,
+                      "reply_to_message_id": reply_to_message_id}),
+        lambda: ((object_guid, text), {"reply_to_message_id": reply_to_message_id}),
+        lambda: ((object_guid, text), {}),
+    ])
+
+
+async def forward_to(client: Client, from_guid: str, to_guid: str, message_id):
+    """Alias kept for clarity in the secretary 'marker' mode (forward the marked
+    Saved-Messages post to a single new PV). Delegates to forward_message()."""
+    return await forward_message(client, from_guid, to_guid, message_id)
