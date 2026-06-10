@@ -185,8 +185,10 @@ async def log(text: str):
 
 
 async def _log_invalid_auth(phone: str):
-    """Log that an account's session is invalid (needs re-login). Per the owner
-    this is expected, not a bug. Also marks the account inactive."""
+    """Log that an account's session is truly invalid (device kicked out / login
+    revoked) AFTER a fresh-connection retry already failed. Per the owner this is
+    expected, not a bug. Marks the account inactive so the panel shows a
+    one-tap re-login button, and tells the user how to recover it."""
     try:
         for a in db.list_accounts():
             if rb.normalize_phone(a["phone"]) == rb.normalize_phone(phone):
@@ -194,11 +196,14 @@ async def _log_invalid_auth(phone: str):
                 break
     except Exception:
         pass
-    await log(card("🔐 INVALID_AUTH", [
+    rows = [
         f"👤 Account : {phone}",
-        "سشن این اکانت باطل شده — باید دوباره لاگین شه (باگ نیست).",
+        "📵 این سشن از روبیکا بیرون انداخته شده (دیوایس logout شده).",
+        "همه‌ی قابلیت‌های این اکانت موقتاً متوقف شدن.",
+        "🔁 برای ریکاوری: «👤 اکانت‌های من» → همین اکانت → «🔁 لاگین مجدد».",
         f"🕒 {now()}",
-    ]))
+    ]
+    await log(card("🔐 INVALID_AUTH — نیاز به لاگین مجدد", rows))
 
 
 async def _on_invalid_auth(phone: str):
@@ -325,14 +330,18 @@ async def account_menu_cb(event):
     if not acc:
         await event.answer("اکانت پیدا نشد.", alert=True)
         return
-    status = "فعال ✅" if acc["status"] == "active" else "غیرفعال ⚠️"
+    status = "فعال ✅" if acc["status"] == "active" else "غیرفعال ⚠️ (سشن باطل)"
     text = card("👤 اکانت", [
         f"📛 نام : {acc['name'] or '-'}",
         f"📱 شماره : {acc['phone']}",
         f"🆔 آیدی : {acc['user_id']}",
         f"⭐️ وضعیت : {status}",
     ])
-    buttons = [
+    buttons = []
+    if acc["status"] != "active":
+        buttons.append([Button.inline("🔁 لاگین مجدد (ریکاوری سشن)",
+                                      f"relogin_{account_id}".encode())])
+    buttons += [
         [Button.inline("🚀 ارسال", f"send_{account_id}".encode()),
          Button.inline("📢 کانال", f"chan_{account_id}".encode())],
         [Button.inline("🗑 حذف اکانت", f"del_{account_id}".encode())],
@@ -361,6 +370,71 @@ async def delete_do_cb(event):
     db.delete_account(account_id)
     await safe_edit(event, "اکانت حذف شد. ✅",
                      buttons=[[Button.inline("🔙 بازگشت", b"accounts")]])
+
+
+@bot.on(events.CallbackQuery(pattern=b"relogin_(\\d+)"))
+async def relogin_cb(event):
+    """Re-login an account whose session was invalidated (device kicked out).
+    Reuses the normal login flow; on success its active features auto-recover."""
+    if not is_owner(event):
+        return
+    account_id = int(event.pattern_match.group(1))
+    acc = db.get_account(account_id)
+    if not acc:
+        await event.answer("اکانت پیدا نشد.", alert=True)
+        return
+    phone = acc["phone"]
+    await safe_edit(event, "⏳ در حال آماده‌سازی لاگین مجدد ...")
+    w = worker.worker_for_account(acc) or worker.ensure_master_worker()
+    if w and not worker.is_local(w):
+        # health-check the owning worker first, like the normal remote login
+        try:
+            await worker.check_worker(w)
+        except Exception:
+            pass
+        w = db.get_worker(w["id"])
+        if not (w and w["enabled"] and w["status"] == "ok"):
+            await safe_edit(event,
+                "❌ ورکر این اکانت الان سالم نیست. اول وضعیت ورکر رو درست کن.",
+                buttons=[[Button.inline("🔙 بازگشت", f"acc_{account_id}".encode())]])
+            return
+        await handle_phone_remote(event, phone, w)
+    else:
+        await _begin_local_login(event, phone, w)
+
+
+async def _recover_account_features(account_id: int):
+    """After a (re)login, relaunch every always-on feature that is still marked
+    enabled for this account, so recovery is automatic."""
+    acc = db.get_account(account_id)
+    if not acc:
+        return
+    if automation_on(account_id):
+        try:
+            await start_automation(acc)
+        except Exception as e:  # noqa: BLE001
+            await log(f"⚠️ ریکاوری اتومیشن {acc['phone']} ناموفق: {repr(e)[:120]}")
+    if secretary_on(account_id):
+        try:
+            await start_secretary(acc)
+        except Exception as e:  # noqa: BLE001
+            await log(f"⚠️ ریکاوری منشی {acc['phone']} ناموفق: {repr(e)[:120]}")
+    if channelreport_on(account_id):
+        try:
+            await start_channelreport(acc)
+        except Exception as e:  # noqa: BLE001
+            await log(f"⚠️ ریکاوری گزارش‌کانال {acc['phone']} ناموفق: {repr(e)[:120]}")
+    if reply_on(account_id):
+        try:
+            await start_reply(acc)
+        except Exception as e:  # noqa: BLE001
+            await log(f"⚠️ ریکاوری ریپلای {acc['phone']} ناموفق: {repr(e)[:120]}")
+    if automation_on(account_id) or secretary_on(account_id) or \
+            channelreport_on(account_id) or reply_on(account_id):
+        await log(card("♻️ FEATURES RECOVERED", [
+            f"👤 Account : {acc['phone']}",
+            "قابلیت‌های فعالِ این اکانت بعد از لاگین مجدد دوباره راه افتادن.",
+            f"🕒 {now()}"]))
 
 
 # --------------------------------------------------------------------------- #
@@ -599,7 +673,17 @@ async def handle_phone(event):
     if not worker.is_local(w):
         await handle_phone_remote(event, phone, w)
         return
+    await _begin_local_login(event, phone, w)
 
+
+async def _begin_local_login(event, phone, w):
+    """Local (master) login flow — shared by first-time add AND re-login."""
+    # closing any warm connection guarantees the fresh login isn't fighting an
+    # old socket for the same session (Feature 6).
+    try:
+        await account_conn.close(phone)
+    except Exception:
+        pass
     # ----- LOCAL master worker: ORIGINAL login logic, unchanged -------------
     try:
         ctx = await rb.start_login(phone)
@@ -685,6 +769,14 @@ async def complete_account(event):
         account_id = db.add_account(phone, name, str(guid), rb.session_path(phone))
         if w.get("id"):
             db.set_account_worker(account_id, w["id"])
+
+        # re-login recovery: a fresh session is in place now -> clear the
+        # invalid flag and relaunch any always-on feature this account had.
+        try:
+            account_conn.reset_invalid(phone)
+            await _recover_account_features(account_id)
+        except Exception:
+            pass
 
         await log(card("LOGIN SUCCESS ✅", [
             f"This Account : {phone}",
@@ -1243,6 +1335,13 @@ async def complete_account_remote(event, ctx, res):
     # session file lives ON THE WORKER, so store an empty local session path.
     account_id = db.add_account(phone, name, str(guid), "")
     db.set_account_worker(account_id, w["id"])
+
+    # re-login recovery: relaunch any always-on feature this account had.
+    try:
+        account_conn.reset_invalid(phone)
+        await _recover_account_features(account_id)
+    except Exception:
+        pass
 
     await log(card("LOGIN SUCCESS ✅", [
         f"This Account : {phone}",
