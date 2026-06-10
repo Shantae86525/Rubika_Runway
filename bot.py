@@ -89,6 +89,8 @@ pending_channel: dict = {}
 stop_flags: dict = {}
 # accounts currently running a send/channel job (in-memory busy lock)
 active_jobs: set = set()
+# owner_id -> [account_id, ...] dead accounts awaiting delete confirmation
+pending_dead_accounts: dict = {}
 # running LOCAL automation tasks: account_id -> {"task":Task, "state":dict}
 automation_tasks: dict = {}
 # running LOCAL automation-EXTRAS tasks: account_id -> {"task":Task, "state":dict}
@@ -345,7 +347,7 @@ async def accounts_sweep_cb(event):
 async def run_accounts_sweep(owner_id: int):
     accounts = db.list_accounts()
     alive = 0
-    dead = 0
+    dead_ids = []          # accounts whose session is confirmed dead
     restored = 0
     rows = []
     for acc in accounts:
@@ -372,8 +374,9 @@ async def run_accounts_sweep(owner_id: int):
             rows.append(f"• {phone} : ❔ بررسی نشد (ورکر/اتصال در دسترس نبود)")
             continue
         if is_dead:
-            dead += 1
-            # stop any always-on features and flag inactive (kick it out)
+            dead_ids.append(aid)
+            # stop any always-on features (kick it out) but DON'T delete yet —
+            # deletion happens only after the owner confirms.
             try:
                 db.set_secretary_enabled(aid, False)
                 db.set_channel_report_enabled(aid, False)
@@ -388,7 +391,7 @@ async def run_accounts_sweep(owner_id: int):
                 except Exception:
                     pass
             db.set_status(aid, "inactive")
-            rows.append(f"• {phone} : 🔴 سشن پریده → غیرفعال شد (نیاز به لاگین مجدد)")
+            rows.append(f"• {phone} : 🔴 سشن پریده (شوت‌شده از سرور)")
         else:
             alive += 1
             if acc["status"] != "active":     # was wrongly inactive -> restore
@@ -397,17 +400,76 @@ async def run_accounts_sweep(owner_id: int):
                 restored += 1
                 rows.append(f"• {phone} : 🟢 سالم (به فعال برگردانده شد)")
     await log(card("🔄 ACCOUNT SWEEP", [
-        f"🟢 سالم: {alive}   🔴 پریده: {dead}   ♻️ بازگردانده: {restored}",
+        f"🟢 سالم: {alive}   🔴 پریده: {len(dead_ids)}   ♻️ بازگردانده: {restored}",
         LINE, *rows, LINE, f"🕒 {now()}"]))
-    try:
+
+    # remember the dead set so the confirm button can delete exactly these
+    pending_dead_accounts[owner_id] = list(dead_ids)
+    if dead_ids:
+        dead_phones = []
+        for aid in dead_ids:
+            a = db.get_account(aid)
+            if a:
+                dead_phones.append(a["phone"])
+        body = "\n".join(f"• {p}" for p in dead_phones)
         await bot.send_message(
             owner_id,
-            f"🔄 بررسی تمام شد.\n🟢 سالم: {alive}\n🔴 پریده (غیرفعال شد): {dead}\n"
-            f"♻️ بازگردانده‌شده: {restored}",
-            buttons=[[Button.inline("👤 اکانت‌های من", b"accounts")],
-                     [Button.inline("🏠 منوی اصلی", b"home")]])
-    except Exception:
-        pass
+            f"🔄 بررسی تمام شد.\n🟢 سالم: {alive}   ♻️ بازگردانده: {restored}\n"
+            f"🔴 {len(dead_ids)} اکانت از سرور شوت شده‌اند:\n{body}\n\n"
+            "می‌خوای این اکانت‌ها کلاً از مدیریت اکانت حذف بشن؟",
+            buttons=[[Button.inline(f"🗑 بله، حذف کن ({len(dead_ids)})", b"acc_sweep_del")],
+                     [Button.inline("🔙 نه، فقط غیرفعال بمونن", b"accounts")]])
+    else:
+        try:
+            await bot.send_message(
+                owner_id,
+                f"🔄 بررسی تمام شد.\n🟢 سالم: {alive}\n🔴 پریده: 0\n"
+                f"♻️ بازگردانده‌شده: {restored}",
+                buttons=[[Button.inline("👤 اکانت‌های من", b"accounts")],
+                         [Button.inline("🏠 منوی اصلی", b"home")]])
+        except Exception:
+            pass
+
+
+@bot.on(events.CallbackQuery(data=b"acc_sweep_del"))
+async def accounts_sweep_delete_cb(event):
+    """Confirmed deletion of the kicked-out accounts found by the last sweep."""
+    if not is_owner(event):
+        return
+    dead_ids = pending_dead_accounts.pop(event.sender_id, [])
+    if not dead_ids:
+        await safe_edit(event, "لیست اکانت‌های پریده منقضی شده. دوباره «🔄 بررسی» رو بزن.",
+                        buttons=[[Button.inline("👤 اکانت‌های من", b"accounts")]])
+        return
+    deleted = []
+    for aid in dead_ids:
+        acc = db.get_account(aid)
+        if not acc:
+            continue
+        phone = acc["phone"]
+        # make sure nothing is still running for it, then delete fully
+        for stopper in (stop_automation, stop_secretary, stop_channelreport,
+                        stop_reply):
+            try:
+                await stopper(acc)
+            except Exception:
+                pass
+        try:
+            await account_conn.close(phone)
+        except Exception:
+            pass
+        try:
+            db.delete_account(aid)
+            deleted.append(phone)
+        except Exception:
+            pass
+    await log(card("🗑 DEAD ACCOUNTS REMOVED", [
+        f"🗑 حذف‌شده: {len(deleted)}",
+        LINE, *[f"• {p}" for p in deleted], LINE, f"🕒 {now()}"]))
+    await safe_edit(event,
+        f"✅ {len(deleted)} اکانتِ پریده کاملاً حذف شدند.",
+        buttons=[[Button.inline("👤 اکانت‌های من", b"accounts")],
+                 [Button.inline("🏠 منوی اصلی", b"home")]])
 
 
 @bot.on(events.CallbackQuery(pattern=b"acc_(\\d+)"))
@@ -3241,6 +3303,100 @@ async def _heal_remote_extra(acc, status_path, starter):
         pass
 
 
+# --------------------------------------------------------------------------- #
+# Health & self-heal engine (موتور سلامت و خودتعمیر).
+# Periodically: verify every account's session, optionally deactivate the dead
+# ones, relaunch any enabled-but-stopped automation, and post one overall
+# system-health card. This is the automatic counterpart of the manual sweep.
+# --------------------------------------------------------------------------- #
+async def health_engine_loop():
+    while True:
+        await asyncio.sleep(max(300, config.HEALTH_ENGINE_INTERVAL))
+        try:
+            await run_health_engine()
+        except Exception as e:  # noqa: BLE001
+            print(f"[health_engine] {e}")
+
+
+async def run_health_engine():
+    accounts = db.list_accounts()
+    alive = 0
+    dead = 0
+    skipped = 0
+    healed = 0
+    dead_rows = []
+    for acc in accounts:
+        phone = acc["phone"]
+        aid = acc["id"]
+        w = worker.worker_for_account(acc)
+        is_dead = False
+        checked = True
+        try:
+            if w and not worker.is_local(w):
+                try:
+                    res = await worker.api_call(
+                        w, "POST", "/account/verify", {"phone": phone}, timeout=90)
+                    is_dead = bool(res.get("dead"))
+                except Exception:
+                    checked = False
+            else:
+                is_dead = await account_conn.verify_session_dead(phone)
+        except Exception:
+            checked = False
+
+        if not checked:
+            skipped += 1
+            continue
+        if is_dead:
+            dead += 1
+            dead_rows.append(f"• {phone} : 🔴 شوت‌شده")
+            if config.HEALTH_ENGINE_AUTODISABLE_DEAD and acc["status"] == "active":
+                # stop features + flag inactive (never auto-delete; that's manual)
+                try:
+                    db.set_secretary_enabled(aid, False)
+                    db.set_channel_report_enabled(aid, False)
+                    db.set_reply_enabled(aid, False)
+                    db.set_automation_enabled(aid, False)
+                except Exception:
+                    pass
+                for stopper in (stop_automation, stop_secretary,
+                                stop_channelreport, stop_reply):
+                    try:
+                        await stopper(acc)
+                    except Exception:
+                        pass
+                db.set_status(aid, "inactive")
+        else:
+            alive += 1
+            # self-heal: an account that is healthy AND has automation enabled
+            # but whose local task is gone -> relaunch it.
+            if automation_on(aid):
+                t = automation_tasks.get(aid)
+                w2 = worker.worker_for_account(acc)
+                local = not (w2 and not worker.is_local(w2))
+                if local and ((not t) or t["task"].done()):
+                    try:
+                        await start_automation(acc)
+                        healed += 1
+                    except Exception:
+                        pass
+
+    rows = [
+        f"🟢 سالم : {alive}",
+        f"🔴 شوت‌شده : {dead}",
+        f"♻️ اتومیشن‌های ترمیم‌شده : {healed}",
+    ]
+    if skipped:
+        rows.append(f"❔ بررسی‌نشده (ورکر در دسترس نبود) : {skipped}")
+    if dead_rows:
+        rows.append(LINE)
+        rows.extend(dead_rows)
+        rows.append("برای حذفِ کامل: «👤 اکانت‌های من» → «🔄 بررسی و پاکسازی».")
+    rows.append(LINE)
+    rows.append(f"🕒 {now()}")
+    await log(card("🩺 موتور سلامت و خودتعمیر", rows))
+
+
 async def extras_worker_loop():
     """Every 30s: drain queued log lines from each remote worker (so worker-side
     secretary/reply/report events show up in the master log group), and relaunch
@@ -3329,6 +3485,9 @@ async def amain():
     await recover_automations()
     # automation EXTRAS: relaunch enabled features + drain remote worker logs/heal
     asyncio.create_task(extras_worker_loop())
+    # health & self-heal engine (verify sessions, relaunch stalled automation,
+    # post overall health card) — موتور سلامت و خودتعمیر
+    asyncio.create_task(health_engine_loop())
     await recover_extras()
     try:
         await bot.run_until_disconnected()

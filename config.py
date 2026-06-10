@@ -68,6 +68,15 @@ AUTOMATION_GROUP_DELAY_MAX = _float("AUTOMATION_GROUP_DELAY_MAX", 2.0)
 # How often (seconds) the master posts the per-account automation summary.
 AUTOMATION_SUMMARY_INTERVAL = _int("AUTOMATION_SUMMARY_INTERVAL", 1200)  # 20 min
 
+# Health & self-heal engine: how often (seconds) it runs a full system pass
+# (verify sessions, relaunch stalled automations, post the overall health card).
+HEALTH_ENGINE_INTERVAL = _int("HEALTH_ENGINE_INTERVAL", 3600)  # 1 hour
+# Auto-deactivate an account whose session the engine finds dead (only flags
+# inactive + stops its features; never deletes — deletion stays manual).
+HEALTH_ENGINE_AUTODISABLE_DEAD = (os.getenv("HEALTH_ENGINE_AUTODISABLE_DEAD",
+                                            "true").strip().lower()
+                                  in ("1", "true", "yes", "on"))
+
 # Pause (seconds) between joining each personal group from the link list.
 GROUP_JOIN_DELAY = _float("GROUP_JOIN_DELAY", 3.0)
 
