@@ -2249,61 +2249,69 @@ async def run_group_join(acc: dict, links: list):
 
 
 async def run_automation_local(account_id: int, phone: str, st: dict):
-    """Local automation loop — now on the SHARED connection (Feature 6). Every
-    interval send a random text to each group (tiny random pause between
-    groups). A group is muted only after 3 failures in a row; if everything
-    gets muted we reset so the loop can recover. Every rubpy call goes through
-    account_conn (per-account lock + warm connection + auto-reconnect) so the
-    secretary / reply responder / channel report on the SAME account interleave
-    safely instead of opening a second session."""
+    """Local automation loop — ONE connection per pass (Feature 6), the same
+    open->work->close shape as the original source automation and the working
+    "send" path. Every interval we open one connection, send a random text to
+    each group on it (tiny random pause between groups), then close it and
+    sleep. The per-account lock inside connection() means secretary / reply /
+    channel report on the SAME account never hold a connection at the same time
+    -> no parallel clients, and opening once-per-pass -> no connect churn."""
     fails: dict = {}          # guid -> consecutive failures
     last_text: dict = {}
     try:
         while not st["stop"]:
             try:
-                groups = await account_conn.call(phone, rb.get_group_guids, timeout=60)
+                async with account_conn.connection(phone) as client:
+                    try:
+                        groups = await asyncio.wait_for(
+                            rb.get_group_guids(client), timeout=60)
+                    except Exception as e:  # noqa: BLE001
+                        if account_conn.is_auth_error(e):
+                            raise
+                        groups = []
+                    st["groups"] = len(groups)
+                    for g in groups:
+                        if st["stop"]:
+                            break
+                        guid = g["guid"]
+                        if guid in st["skipped"]:
+                            continue
+                        idx, txt = _pick_text(st["texts"], last_text.get(guid))
+                        if txt is None:
+                            break
+                        try:
+                            await asyncio.wait_for(
+                                rb.send_text(client, guid, txt),
+                                timeout=config.SEND_TIMEOUT)
+                        except Exception as e:  # noqa: BLE001
+                            if account_conn.is_auth_error(e):
+                                raise
+                            fails[guid] = fails.get(guid, 0) + 1
+                            if fails[guid] >= 3:
+                                st["skipped"].add(guid)   # mute after 3 failures
+                        else:
+                            st["sent"] += 1
+                            last_text[guid] = idx
+                            fails[guid] = 0
+                            try:                  # a brief DB lock must NOT count as a send error
+                                db.incr_automation_sent(account_id, 1)
+                            except Exception:
+                                pass
+                        await asyncio.sleep(random.uniform(
+                            config.AUTOMATION_GROUP_DELAY_MIN,
+                            config.AUTOMATION_GROUP_DELAY_MAX))
+                    # recovery: if every group ended up muted, reset
+                    if groups and all(g["guid"] in st["skipped"] for g in groups):
+                        st["skipped"].clear()
+                        fails.clear()
             except account_conn.InvalidAuthError:
                 await _log_invalid_auth(phone)
                 break
-            except Exception:
-                groups = []
-            st["groups"] = len(groups)
-            for g in groups:
-                if st["stop"]:
-                    break
-                guid = g["guid"]
-                if guid in st["skipped"]:
-                    continue
-                idx, txt = _pick_text(st["texts"], last_text.get(guid))
-                if txt is None:
-                    break
-                try:
-                    await account_conn.call(phone, rb.send_text, guid, txt,
-                                            timeout=config.SEND_TIMEOUT)
-                except account_conn.InvalidAuthError:
+            except Exception as e:  # noqa: BLE001
+                if account_conn.is_auth_error(e):
                     await _log_invalid_auth(phone)
-                    st["stop"] = True
                     break
-                except Exception:
-                    fails[guid] = fails.get(guid, 0) + 1
-                    if fails[guid] >= 3:
-                        st["skipped"].add(guid)   # mute after repeated failures
-                else:
-                    st["sent"] += 1
-                    last_text[guid] = idx
-                    fails[guid] = 0
-                    try:                       # a brief DB lock must NOT count as a send error
-                        db.incr_automation_sent(account_id, 1)
-                    except Exception:
-                        pass
-                await asyncio.sleep(random.uniform(
-                    config.AUTOMATION_GROUP_DELAY_MIN,
-                    config.AUTOMATION_GROUP_DELAY_MAX))
-            # recovery: if every group ended up muted, reset (the manager will
-            # transparently reconnect on the next call if needed)
-            if groups and all(g["guid"] in st["skipped"] for g in groups):
-                st["skipped"].clear()
-                fails.clear()
+                await log(f"⚠️ اتومیشن «{phone}» خطای دور: {repr(e)[:150]}")
             waited = 0
             while waited < st["interval"] and not st["stop"]:
                 await asyncio.sleep(1)
