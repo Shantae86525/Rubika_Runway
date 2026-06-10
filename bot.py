@@ -770,14 +770,6 @@ async def complete_account(event):
         if w.get("id"):
             db.set_account_worker(account_id, w["id"])
 
-        # re-login recovery: a fresh session is in place now -> clear the
-        # invalid flag and relaunch any always-on feature this account had.
-        try:
-            account_conn.reset_invalid(phone)
-            await _recover_account_features(account_id)
-        except Exception:
-            pass
-
         await log(card("LOGIN SUCCESS ✅", [
             f"This Account : {phone}",
             LINE,
@@ -800,9 +792,19 @@ async def complete_account(event):
         )
     except Exception as e:  # noqa: BLE001
         await event.respond(f"❌ خطا بعد از ورود: {e}")
+        account_id = None
     finally:
         try:
             await client.disconnect()
+        except Exception:
+            pass
+
+    # re-login recovery runs ONLY after the login client is fully disconnected,
+    # so the recovered features never open a second connection alongside it.
+    if account_id:
+        try:
+            account_conn.reset_invalid(phone)
+            await _recover_account_features(account_id)
         except Exception:
             pass
 

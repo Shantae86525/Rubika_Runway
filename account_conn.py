@@ -1,30 +1,29 @@
 """
-account_conn.py — Feature #6: "one warm connection + a fine-grained queue per
-account".
-=============================================================================
+account_conn.py — Feature #6: "one connection at a time, per account".
+======================================================================
 
 Why this exists
 ---------------
 The continuous automation features (rotating-texts automation, the PV
 "secretary", the group-reply responder and the channel report) may all be
 active on the SAME Rubika account at the same time. rubpy keeps one network
-session per account; if two coroutines fire `await client.xxx()` on that
-session concurrently their round-trips interleave and Rubika invalidates the
-session (INVALID_AUTH). The old code avoided that only because the panel made
-every operation mutually exclusive — that no longer holds once several
-always-on features share an account.
+session per account; if two coroutines touch that session concurrently — OR if
+a second rubpy client connects while another is still connected — Rubika
+invalidates the session (INVALID_AUTH). The old single-feature code avoided
+that only because the panel made every operation mutually exclusive; that no
+longer holds once several always-on features share an account.
 
-The fix (kept deliberately simple):
-  * keep ONE warm rubpy client per account (lazily opened, auto-reconnect),
-  * guard every single rubpy call with a per-account asyncio.Lock so only one
-    call ever touches the session at a time,
-  * callers do `await account_conn.call(phone, rb.send_text, guid, txt)` — the
-    lock is held only for that one short call, sleeps/waits happen OUTSIDE it,
-    so the features interleave fairly instead of blocking each other,
-  * a tiny janitor closes a connection that has been idle for a while (so many
-    accounts don't keep N sockets open forever),
-  * INVALID_AUTH is detected and surfaced (the account must be re-logged-in;
-    per the project owner this is expected, not a bug).
+The fix (matches the project's ORIGINAL safe pattern: open -> use -> close):
+  * every call goes through ``account_conn.call(phone, fn, ...)``,
+  * a per-account asyncio.Lock serialises calls so only ONE runs at a time,
+  * INSIDE the lock we OPEN a fresh rubpy client, run the single op, then CLOSE
+    it again before releasing the lock. We never keep a connection open across
+    calls, so two rubpy clients can never be connected to the same session at
+    once (which is exactly what produced the INVALID_AUTH storms).
+  * callers keep ``fn`` a SHORT single operation and do sleeps/waits OUTSIDE
+    the call, so the features interleave fairly instead of blocking each other.
+  * INVALID_AUTH is surfaced as InvalidAuthError (the account must be
+    re-logged-in; per the project owner this is expected, not a bug).
 
 This module is imported by BOTH the master (bot.py) and the worker
 (worker_api.py); it behaves identically on each because both run rubpy locally
@@ -34,28 +33,23 @@ for the accounts they own. It does NOT import bot/worker — the optional
 from __future__ import annotations
 
 import asyncio
-import time
 
-import config
 import rubika_client as rb
 
 
 # --------------------------------------------------------------------------- #
-# Per-account connection state
+# Per-account serialisation state
 # --------------------------------------------------------------------------- #
 class _Conn:
-    __slots__ = ("phone", "lock", "client", "last_used", "invalid")
+    __slots__ = ("phone", "lock", "invalid")
 
     def __init__(self, phone: str):
         self.phone = phone
         self.lock = asyncio.Lock()
-        self.client = None          # rubpy Client or None
-        self.last_used = 0.0        # monotonic timestamp of last use
         self.invalid = False        # True once the session was invalidated
 
 
 _conns: dict = {}                   # normalized phone -> _Conn
-_janitor_task = None
 
 # optional async callback: async def handler(phone: str) -> None
 _invalid_auth_handler = None
@@ -88,85 +82,52 @@ def _is_invalid_auth(err: Exception) -> bool:
             or "INVALIDAUTH" in s or "AUTH_FROM_ANOTHER" in s)
 
 
-async def _ensure_connected(c: _Conn):
-    if c.client is not None:
-        return c.client
-    client = rb.open_client(c.phone)
-    await rb.connect_ready(client)
-    c.client = client
-    return client
-
-
-async def _drop(c: _Conn):
-    cl = c.client
-    c.client = None
-    if cl is not None:
-        try:
-            await cl.disconnect()
-        except Exception:
-            pass
-
-
 class InvalidAuthError(RuntimeError):
     """Raised by call() when the account session is invalid (needs re-login)."""
 
 
+async def _disconnect_quietly(client):
+    if client is None:
+        return
+    try:
+        await client.disconnect()
+    except Exception:
+        pass
+
+
 async def call(phone: str, fn, *args, timeout: float = None, **kwargs):
-    """Run ``fn(client, *args, **kwargs)`` on the account's warm connection
-    while holding its per-account lock (so only one call touches the session at
-    a time). Raises InvalidAuthError ONLY if the session is truly invalid.
+    """Serialised, single-connection call.
 
-    Robustness: a single INVALID_AUTH on an old/stale warm connection does NOT
-    mean the session is dead — Rubika sometimes returns it on a wedged socket.
-    So on INVALID_AUTH we drop the connection, build a COMPLETELY FRESH one and
-    retry; only if a fresh connection ALSO reports INVALID_AUTH do we declare
-    the session invalid. This stops false "session expired" alarms while the
-    account is in fact still logged in.
+    Holds the account's per-account lock, OPENS a fresh rubpy client, runs
+    ``fn(client, *args, **kwargs)`` once, then CLOSES the client before
+    releasing the lock. Because the connection never outlives the call, two
+    clients can never be connected to the same session simultaneously, which is
+    what caused the INVALID_AUTH storms when several always-on features shared
+    one account.
 
-    NOTE: keep ``fn`` a SHORT single operation and do any sleeping OUTSIDE this
-    call, so the other features on the same account get their turn quickly.
+    Raises InvalidAuthError if Rubika reports the session is invalid (the
+    account must be re-logged-in). Keep ``fn`` SHORT and do sleeps OUTSIDE.
     """
     c = _get_conn(phone)
     async with c.lock:
-        c.last_used = time.monotonic()
-        last_err = None
-        auth_failures = 0
-        # up to 3 tries: enough for one stale-conn retry + one transient retry
-        for attempt in range(1, 4):
-            try:
-                client = await _ensure_connected(c)
-                if timeout:
-                    res = await asyncio.wait_for(fn(client, *args, **kwargs),
-                                                 timeout=timeout)
-                else:
-                    res = await fn(client, *args, **kwargs)
-                c.last_used = time.monotonic()
-                return res
-            except asyncio.TimeoutError as e:
-                # a stuck call: drop the (maybe wedged) connection and bubble up
-                last_err = e
-                await _drop(c)
-                raise
-            except Exception as e:  # noqa: BLE001
-                last_err = e
-                if _is_invalid_auth(e):
-                    auth_failures += 1
-                    await _drop(c)                 # throw away the stale socket
-                    if auth_failures >= 2:
-                        # a FRESH connection still rejected -> really invalid
-                        c.invalid = True
-                        await _notify_invalid(c.phone)
-                        raise InvalidAuthError(f"{c.phone}: session invalid") from e
-                    # first time: rebuild a brand-new connection and retry
-                    await asyncio.sleep(1.0)
-                    continue
-                # transient/connection error -> drop and retry
-                await _drop(c)
-                if attempt >= 3:
-                    raise
-                await asyncio.sleep(1.0)
-        if last_err:
-            raise last_err
+        client = None
+        try:
+            client = rb.open_client(c.phone)
+            await rb.connect_ready(client)
+            if timeout:
+                res = await asyncio.wait_for(fn(client, *args, **kwargs),
+                                             timeout=timeout)
+            else:
+                res = await fn(client, *args, **kwargs)
+            return res
+        except Exception as e:  # noqa: BLE001
+            if _is_invalid_auth(e):
+                c.invalid = True
+                await _notify_invalid(c.phone)
+                raise InvalidAuthError(f"{c.phone}: session invalid") from e
+            raise
+        finally:
+            await _disconnect_quietly(client)
 
 
 async def _notify_invalid(phone: str):
@@ -179,24 +140,23 @@ async def _notify_invalid(phone: str):
 
 
 async def close(phone: str):
-    """Force-close a single account's warm connection (e.g. on delete/re-login).
-    Safe to call even if nothing is open."""
+    """Acquire the account's lock briefly so any in-flight call finishes; there
+    is no persistent connection to tear down (open->use->close model). Clearing
+    the invalid flag lets a subsequent (re)login start clean."""
     c = _conns.get(_key(phone))
     if not c:
         return
-    async with c.lock:
-        await _drop(c)
-        c.invalid = False
+    try:
+        async with c.lock:
+            c.invalid = False
+    except Exception:
+        pass
 
 
 async def close_all():
-    """Close every warm connection (call on shutdown)."""
-    for c in list(_conns.values()):
-        try:
-            async with c.lock:
-                await _drop(c)
-        except Exception:
-            pass
+    """Nothing persistent to close (open->use->close model). Kept for API
+    compatibility with callers (e.g. bot shutdown)."""
+    return
 
 
 def reset_invalid(phone: str):
@@ -211,37 +171,7 @@ def is_invalid(phone: str) -> bool:
     return bool(c and c.invalid)
 
 
-# --------------------------------------------------------------------------- #
-# Idle janitor: close connections that have not been used for a while so a
-# large number of accounts does not keep N sockets open forever.
-# --------------------------------------------------------------------------- #
-async def _janitor_loop():
-    idle = max(60, int(config.CONN_IDLE_CLOSE_SEC))
-    while True:
-        await asyncio.sleep(60)
-        now = time.monotonic()
-        for c in list(_conns.values()):
-            if c.client is None:
-                continue
-            if c.lock.locked():
-                continue  # in use right now
-            if (now - c.last_used) < idle:
-                continue
-            try:
-                # acquire briefly; skip if a caller grabbed it meanwhile
-                await asyncio.wait_for(c.lock.acquire(), timeout=0.1)
-            except Exception:
-                continue
-            try:
-                if c.client is not None and (time.monotonic() - c.last_used) >= idle:
-                    await _drop(c)
-            finally:
-                c.lock.release()
-
-
 def start_janitor():
-    """Start the idle-connection janitor (idempotent). Returns the task."""
-    global _janitor_task
-    if _janitor_task is None or _janitor_task.done():
-        _janitor_task = asyncio.create_task(_janitor_loop())
-    return _janitor_task
+    """No-op in the open->use->close model (no idle sockets to reap). Kept so
+    existing callers (bot.amain / worker startup) don't need to change."""
+    return None
