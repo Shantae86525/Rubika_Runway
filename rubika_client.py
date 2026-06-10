@@ -932,3 +932,18 @@ async def forward_to(client: Client, from_guid: str, to_guid: str, message_id):
     """Alias kept for clarity in the secretary 'marker' mode (forward the marked
     Saved-Messages post to a single new PV). Delegates to forward_message()."""
     return await forward_message(client, from_guid, to_guid, message_id)
+
+
+
+async def leave_group(client: Client, group_guid: str):
+    """Leave a group. Tolerant of rubpy version differences in method name."""
+    for name in ("leave_group", "leave_chat", "left_group"):
+        fn = getattr(client, name, None)
+        if fn is None:
+            continue
+        return await _try_call(fn, [
+            lambda: ((group_guid,), {}),
+            lambda: ((), {"group_guid": group_guid}),
+            lambda: ((), {"object_guid": group_guid}),
+        ])
+    raise RuntimeError("this rubpy build has no leave_group()")

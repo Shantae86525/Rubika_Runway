@@ -472,6 +472,83 @@ async def accounts_sweep_delete_cb(event):
                  [Button.inline("🏠 منوی اصلی", b"home")]])
 
 
+# --------------------------------------------------------------------------- #
+# Cleanup engine (موتور پاکسازی): groups where an account got banned/muted are
+# recorded as candidates; the owner reviews them in a confirm/cancel panel and
+# decides to leave them or keep them.
+# --------------------------------------------------------------------------- #
+async def _log_cleanup_candidate(account_id: int, phone: str, guid: str, name: str):
+    """Log a freshly detected banned/muted group with a confirm/cancel panel."""
+    rows = [
+        f"👤 Account : {phone}",
+        f"👥 Group : {name or guid}",
+        f"🆔 {guid}",
+        "⛔ این گروه اکانت رو بن/سکوت کرده (ارسال ممکن نیست).",
+        "می‌خوای ازش خارج بشه؟",
+        f"🕒 {now()}",
+    ]
+    try:
+        await bot.send_message(
+            config.LOG_GROUP_ID, card("🧹 موتور پاکسازی — گروه بن/سکوت", rows),
+            buttons=[[Button.inline("✅ تأیید خروج",
+                                    f"clnyes_{account_id}_{guid}".encode())],
+                     [Button.inline("🚫 لغو (بمونه)",
+                                    f"clnno_{account_id}_{guid}".encode())]])
+    except Exception as e:  # noqa: BLE001
+        print(f"[cleanup log] {e}")
+
+
+@bot.on(events.CallbackQuery(pattern=b"clnyes_(\\d+)_(.+)"))
+async def cleanup_confirm_cb(event):
+    """Owner confirmed leaving a banned/muted group."""
+    if not is_owner(event):
+        return
+    account_id = int(event.pattern_match.group(1))
+    guid = event.pattern_match.group(2).decode()
+    acc = db.get_account(account_id)
+    if not acc:
+        await event.answer("اکانت پیدا نشد.", alert=True)
+        return
+    await event.answer("در حال خروج از گروه ...")
+    phone = acc["phone"]
+    ok = False
+    try:
+        w = worker.worker_for_account(acc)
+        if w and not worker.is_local(w):
+            res = await worker.api_call(w, "POST", "/group/leave",
+                                        {"phone": phone, "group_guid": guid},
+                                        timeout=90)
+            ok = bool(res.get("ok"))
+        else:
+            await account_conn.call(phone, rb.leave_group, guid, timeout=60)
+            ok = True
+    except Exception as e:  # noqa: BLE001
+        await safe_edit(event, f"❌ خروج ناموفق: {repr(e)[:120]}")
+        return
+    db.remove_cleanup_candidate(account_id, guid)
+    await safe_edit(event, card("🧹 موتور پاکسازی", [
+        f"👤 Account : {phone}",
+        f"👥 Group : {guid}",
+        ("✅ از گروه خارج شد." if ok else "⚠️ خروج نامشخص بود."),
+        f"🕒 {now()}",
+    ]))
+
+
+@bot.on(events.CallbackQuery(pattern=b"clnno_(\\d+)_(.+)"))
+async def cleanup_cancel_cb(event):
+    """Owner chose to keep the group; just drop it from the candidate list."""
+    if not is_owner(event):
+        return
+    account_id = int(event.pattern_match.group(1))
+    guid = event.pattern_match.group(2).decode()
+    db.remove_cleanup_candidate(account_id, guid)
+    await safe_edit(event, card("🧹 موتور پاکسازی", [
+        f"👥 Group : {guid}",
+        "🚫 لغو شد — گروه می‌مونه (دیگه تو این لیست نیست).",
+        f"🕒 {now()}",
+    ]))
+
+
 @bot.on(events.CallbackQuery(pattern=b"acc_(\\d+)"))
 async def account_menu_cb(event):
     if not is_owner(event):
@@ -2460,6 +2537,18 @@ async def run_automation_local(account_id: int, phone: str, st: dict):
                             fails[guid] = fails.get(guid, 0) + 1
                             if fails[guid] >= 3:
                                 st["skipped"].add(guid)
+                                # cleanup engine: record this banned/muted group
+                                # as a candidate (logged once) for the owner to
+                                # review + confirm leaving.
+                                try:
+                                    is_new = db.add_cleanup_candidate(
+                                        account_id, guid, g.get("name", ""),
+                                        reason="بن/سکوت یا عدم امکان ارسال")
+                                    if is_new:
+                                        await _log_cleanup_candidate(
+                                            account_id, phone, guid, g.get("name", ""))
+                                except Exception:
+                                    pass
                         else:
                             st["sent"] += 1
                             last_text[guid] = idx

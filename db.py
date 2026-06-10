@@ -911,3 +911,84 @@ def count_verified_group_links() -> int:
     row = conn.execute("SELECT COUNT(*) AS n FROM verified_group_links").fetchone()
     conn.close()
     return int(row["n"]) if row else 0
+
+
+
+# --------------------------------------------------------------------------- #
+# Cleanup engine (موتور پاکسازی): groups where an account got banned/muted
+# (couldn't send after repeated tries) are recorded here as "candidates". The
+# owner reviews them in a confirm/cancel panel and decides to leave or keep.
+# --------------------------------------------------------------------------- #
+def _ensure_cleanup_table():
+    conn = _conn()
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS cleanup_candidates (
+            account_id  INTEGER,
+            group_guid  TEXT,
+            group_name  TEXT,
+            reason      TEXT,
+            detected_at TEXT,
+            PRIMARY KEY (account_id, group_guid)
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def add_cleanup_candidate(account_id: int, group_guid: str, group_name: str = "",
+                          reason: str = "banned/muted"):
+    """Record a group the account can no longer post to (idempotent). Returns
+    True if it was NEW (so the caller logs it only once)."""
+    _ensure_cleanup_table()
+    conn = _conn()
+    existing = conn.execute(
+        "SELECT 1 FROM cleanup_candidates WHERE account_id = ? AND group_guid = ?",
+        (int(account_id), str(group_guid))).fetchone()
+    conn.execute(
+        "INSERT OR IGNORE INTO cleanup_candidates (account_id, group_guid, "
+        "group_name, reason, detected_at) VALUES (?, ?, ?, ?, ?)",
+        (int(account_id), str(group_guid), group_name or "", reason or "", _now()))
+    conn.commit()
+    conn.close()
+    return existing is None
+
+
+def list_cleanup_candidates(account_id: int) -> list:
+    _ensure_cleanup_table()
+    conn = _conn()
+    rows = conn.execute(
+        "SELECT group_guid, group_name, reason, detected_at FROM cleanup_candidates "
+        "WHERE account_id = ? ORDER BY detected_at", (int(account_id),)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def count_cleanup_candidates(account_id: int) -> int:
+    _ensure_cleanup_table()
+    conn = _conn()
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM cleanup_candidates WHERE account_id = ?",
+        (int(account_id),)).fetchone()
+    conn.close()
+    return int(row["n"]) if row else 0
+
+
+def remove_cleanup_candidate(account_id: int, group_guid: str):
+    _ensure_cleanup_table()
+    conn = _conn()
+    conn.execute(
+        "DELETE FROM cleanup_candidates WHERE account_id = ? AND group_guid = ?",
+        (int(account_id), str(group_guid)))
+    conn.commit()
+    conn.close()
+
+
+def clear_cleanup_candidates(account_id: int):
+    _ensure_cleanup_table()
+    conn = _conn()
+    conn.execute("DELETE FROM cleanup_candidates WHERE account_id = ?",
+                 (int(account_id),))
+    conn.commit()
+    conn.close()

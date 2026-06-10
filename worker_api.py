@@ -152,6 +152,10 @@ def _build_app():
     class PhoneIn(BaseModel):
         phone: str
 
+    class GroupLeaveIn(BaseModel):
+        phone: str
+        group_guid: str
+
     class ChannelCreateIn(BaseModel):
         phone: str
         marker: str
@@ -506,6 +510,16 @@ def _build_app():
         _auth(authorization)
         dead = await account_conn.verify_session_dead(body.phone)
         return {"ok": True, "dead": bool(dead)}
+
+    @app.post("/group/leave")
+    async def group_leave(body: GroupLeaveIn, authorization: str = Header(None)):
+        _auth(authorization)
+        try:
+            await account_conn.call(body.phone, rb.leave_group, body.group_guid,
+                                    timeout=60)
+            return {"ok": True}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": repr(e)[:160]}
 
     @app.get("/extras/logs")
     async def extras_logs(authorization: str = Header(None)):
