@@ -20,6 +20,7 @@ import asyncio
 import os
 import random
 import tempfile
+import time
 import zipfile
 from datetime import datetime
 
@@ -317,8 +318,90 @@ async def accounts_cb(event):
         mark = "" if acc["status"] == "active" else " ⚠️"
         buttons.append([Button.inline(f"{i}- {acc['phone']}{mark}",
                                       f"acc_{acc['id']}".encode())])
+    buttons.append([Button.inline("🔄 بررسی و پاکسازی اکانت‌های پریده",
+                                  b"acc_sweep")])
     buttons.append([Button.inline("🔙 بازگشت", b"home")])
     await safe_edit(event, "👤 اکانت‌های تو:", buttons=buttons)
+
+
+@bot.on(events.CallbackQuery(data=b"acc_sweep"))
+async def accounts_sweep_cb(event):
+    """Update step: check every account's session and flag the dead ones
+    (sessions that were kicked out / logged out) as inactive, so the panel
+    clearly shows which accounts need a re-login. Healthy accounts that were
+    wrongly marked inactive are restored to active."""
+    if not is_owner(event):
+        return
+    await safe_edit(event, "🔄 در حال بررسی سشنِ همه‌ی اکانت‌ها ... (ممکنه کمی طول بکشه)")
+    asyncio.create_task(run_accounts_sweep(event.sender_id))
+
+
+async def run_accounts_sweep(owner_id: int):
+    accounts = db.list_accounts()
+    alive = 0
+    dead = 0
+    restored = 0
+    rows = []
+    for acc in accounts:
+        phone = acc["phone"]
+        aid = acc["id"]
+        w = worker.worker_for_account(acc)
+        is_dead = False
+        checked = True
+        try:
+            if w and not worker.is_local(w):
+                # ask the owning worker to verify the session
+                try:
+                    res = await worker.api_call(
+                        w, "POST", "/account/verify", {"phone": phone}, timeout=90)
+                    is_dead = bool(res.get("dead"))
+                except Exception:
+                    checked = False           # worker unreachable -> don't touch
+            else:
+                is_dead = await account_conn.verify_session_dead(phone)
+        except Exception:
+            checked = False
+
+        if not checked:
+            rows.append(f"• {phone} : ❔ بررسی نشد (ورکر/اتصال در دسترس نبود)")
+            continue
+        if is_dead:
+            dead += 1
+            # stop any always-on features and flag inactive (kick it out)
+            try:
+                db.set_secretary_enabled(aid, False)
+                db.set_channel_report_enabled(aid, False)
+                db.set_reply_enabled(aid, False)
+                db.set_automation_enabled(aid, False)
+            except Exception:
+                pass
+            for stopper in (stop_automation, stop_secretary, stop_channelreport,
+                            stop_reply):
+                try:
+                    await stopper(acc)
+                except Exception:
+                    pass
+            db.set_status(aid, "inactive")
+            rows.append(f"• {phone} : 🔴 سشن پریده → غیرفعال شد (نیاز به لاگین مجدد)")
+        else:
+            alive += 1
+            if acc["status"] != "active":     # was wrongly inactive -> restore
+                db.set_status(aid, "active")
+                account_conn.reset_invalid(phone)
+                restored += 1
+                rows.append(f"• {phone} : 🟢 سالم (به فعال برگردانده شد)")
+    await log(card("🔄 ACCOUNT SWEEP", [
+        f"🟢 سالم: {alive}   🔴 پریده: {dead}   ♻️ بازگردانده: {restored}",
+        LINE, *rows, LINE, f"🕒 {now()}"]))
+    try:
+        await bot.send_message(
+            owner_id,
+            f"🔄 بررسی تمام شد.\n🟢 سالم: {alive}\n🔴 پریده (غیرفعال شد): {dead}\n"
+            f"♻️ بازگردانده‌شده: {restored}",
+            buttons=[[Button.inline("👤 اکانت‌های من", b"accounts")],
+                     [Button.inline("🏠 منوی اصلی", b"home")]])
+    except Exception:
+        pass
 
 
 @bot.on(events.CallbackQuery(pattern=b"acc_(\\d+)"))
@@ -2260,6 +2343,7 @@ async def run_automation_local(account_id: int, phone: str, st: dict):
     last_text: dict = {}
     try:
         while not st["stop"]:
+            st["heartbeat"] = time.monotonic()   # watchdog: prove we're alive
             try:
                 async with account_conn.connection(phone) as client:
                     try:
@@ -2268,6 +2352,10 @@ async def run_automation_local(account_id: int, phone: str, st: dict):
                     except Exception as e:  # noqa: BLE001
                         if account_conn.is_auth_error(e):
                             raise
+                        # a stuck/slow call may have left the socket half-dead;
+                        # drop it so the NEXT pass reconnects fresh instead of
+                        # silently reusing a broken connection.
+                        account_conn.drop_connection(phone)
                         groups = []
                     st["groups"] = len(groups)
                     for g in groups:
@@ -2285,6 +2373,11 @@ async def run_automation_local(account_id: int, phone: str, st: dict):
                                 timeout=config.SEND_TIMEOUT)
                         except Exception as e:  # noqa: BLE001
                             if account_conn.is_auth_error(e):
+                                raise
+                            if isinstance(e, asyncio.TimeoutError):
+                                # a stuck send can wedge the socket -> drop it so
+                                # the next pass reconnects; end this pass now.
+                                account_conn.drop_connection(phone)
                                 raise
                             fails[guid] = fails.get(guid, 0) + 1
                             if fails[guid] >= 3:
@@ -2311,7 +2404,12 @@ async def run_automation_local(account_id: int, phone: str, st: dict):
                 if account_conn.is_auth_error(e):
                     await _log_invalid_auth(phone)
                     break
-                await log(f"⚠️ اتومیشن «{phone}» خطای دور: {repr(e)[:150]}")
+                # any other per-pass error (incl. a dropped stuck socket): drop
+                # the connection so next pass is fresh, log once, and CONTINUE
+                # the loop (do NOT kill automation).
+                account_conn.drop_connection(phone)
+                await log(f"⚠️ اتومیشن «{phone}» خطای دور (ادامه می‌دهد): {repr(e)[:150]}")
+            st["heartbeat"] = time.monotonic()
             waited = 0
             while waited < st["interval"] and not st["stop"]:
                 await asyncio.sleep(1)
@@ -2339,7 +2437,7 @@ async def start_automation(acc: dict):
         except Exception:
             pass
     st = {"stop": False, "sent": 0, "groups": 0, "skipped": set(),
-          "texts": texts, "interval": interval}
+          "texts": texts, "interval": interval, "heartbeat": time.monotonic()}
     task = asyncio.create_task(run_automation_local(account_id, acc["phone"], st))
     automation_tasks[account_id] = {"task": task, "state": st}
 
@@ -2359,8 +2457,10 @@ async def stop_automation(acc: dict):
 
 
 async def automation_summary_loop():
-    """Every AUTOMATION_SUMMARY_INTERVAL, post a per-account total. Also re-heals
-    remote automations whose worker container restarted (loop got wiped)."""
+    """Every AUTOMATION_SUMMARY_INTERVAL, post a per-account total. Also self-
+    heals automations that stopped: relaunches a worker automation whose
+    container restarted AND a LOCAL automation whose task died or hung (no
+    heartbeat within 3x its interval)."""
     while True:
         await asyncio.sleep(config.AUTOMATION_SUMMARY_INTERVAL)
         try:
@@ -2381,6 +2481,35 @@ async def automation_summary_loop():
                         groups = stt.get("groups")
                     except Exception:
                         pass
+                else:
+                    # LOCAL self-heal: relaunch if the task is gone, finished,
+                    # or hung (heartbeat older than 3x interval -> silent stall).
+                    t = automation_tasks.get(au["account_id"])
+                    interval = au.get("interval_sec") or config.AUTOMATION_MIN_INTERVAL
+                    stale = (3 * max(interval, 10)) + 120
+                    dead = (not t) or t["task"].done()
+                    hung = False
+                    if t and not dead:
+                        hb = t["state"].get("heartbeat", 0)
+                        hung = (time.monotonic() - hb) > stale
+                    if dead or hung:
+                        if hung:                       # a hung task must be cancelled
+                            try:
+                                t["state"]["stop"] = True
+                                t["task"].cancel()
+                            except Exception:
+                                pass
+                        await log(card("♻️ AUTOMATION SELF-HEAL", [
+                            f"👤 Account : {acc['phone']}",
+                            ("علت: تسک متوقف شده بود" if dead else "علت: هنگ بی‌صدا (بدون فعالیت)"),
+                            "اتومیشن دوباره راه‌اندازی شد.",
+                            f"🕒 {now()}"]))
+                        try:
+                            await start_automation(acc)
+                        except Exception as e:  # noqa: BLE001
+                            await log(f"⚠️ self-heal اتومیشن {acc['phone']} ناموفق: {repr(e)[:120]}")
+                    if t and t["state"].get("groups") is not None:
+                        groups = t["state"].get("groups")
                 rows = [f"👤 Account : {acc['phone']}", f"✅ مجموع ارسال : {sent}"]
                 if groups is not None:
                     rows.append(f"👥 گروه‌ها : {groups}")

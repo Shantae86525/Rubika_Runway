@@ -225,6 +225,23 @@ def reset_invalid(phone: str):
         c.invalid = False
 
 
+def drop_connection(phone: str):
+    """Schedule a force-close of the account's warm connection WITHOUT awaiting
+    (safe to call from inside a loop after a stuck/timed-out call). The actual
+    disconnect runs in the background; the next connection() will reconnect.
+    """
+    c = _conns.get(_key(phone))
+    if not c:
+        return
+    cl = c.client
+    c.client = None
+    if cl is not None:
+        try:
+            asyncio.create_task(_disconnect_quietly(cl))
+        except RuntimeError:
+            pass
+
+
 def is_invalid(phone: str) -> bool:
     c = _conns.get(_key(phone))
     return bool(c and c.invalid)

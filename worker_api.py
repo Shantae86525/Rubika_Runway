@@ -149,6 +149,9 @@ def _build_app():
         phone: str
         marker: str
 
+    class PhoneIn(BaseModel):
+        phone: str
+
     class ChannelCreateIn(BaseModel):
         phone: str
         marker: str
@@ -498,6 +501,12 @@ def _build_app():
                                           timeout=60)
         return {"ok": True, "changed": bool(changed)}
 
+    @app.post("/account/verify")
+    async def account_verify(body: PhoneIn, authorization: str = Header(None)):
+        _auth(authorization)
+        dead = await account_conn.verify_session_dead(body.phone)
+        return {"ok": True, "dead": bool(dead)}
+
     @app.get("/extras/logs")
     async def extras_logs(authorization: str = Header(None)):
         _auth(authorization)
@@ -551,6 +560,7 @@ async def _run_automation(phone: str, state: dict):
                     except Exception as e:  # noqa: BLE001
                         if account_conn.is_auth_error(e):
                             raise
+                        account_conn.drop_connection(phone)
                         groups = []
                     state["groups"] = len(groups)
                     for g in groups:
