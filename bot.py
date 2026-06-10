@@ -2426,6 +2426,12 @@ def _stop_local(tasks: dict, account_id: int):
     t = tasks.pop(account_id, None)
     if t:
         t["state"]["stop"] = True
+        # also cancel the task so it stops promptly even if it is mid-sleep or
+        # mid-call; otherwise a long interval could keep it running one more pass
+        # after the user turned the feature off in the panel.
+        task = t.get("task")
+        if task and not task.done():
+            task.cancel()
 
 
 # ---- Feature 1: secretary ----
