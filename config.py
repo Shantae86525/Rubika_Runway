@@ -80,6 +80,13 @@ HEALTH_ENGINE_AUTODISABLE_DEAD = (os.getenv("HEALTH_ENGINE_AUTODISABLE_DEAD",
 # Pause (seconds) between joining each personal group from the link list.
 GROUP_JOIN_DELAY = _float("GROUP_JOIN_DELAY", 3.0)
 
+# ---- Generator engine (موتور مولد) ----
+# How often (seconds) to poll user_is_admin while waiting for the owner to
+# promote the joined accounts to admin.
+GENERATOR_ADMIN_POLL = _int("GENERATOR_ADMIN_POLL", 15)
+# Pause (seconds) between each account's join, and between member-add batches.
+GENERATOR_JOIN_DELAY = _float("GENERATOR_JOIN_DELAY", 4.0)
+
 # --------------------------------------------------------------------------- #
 # Automation EXTRAS (additive — Feature set: secretary / channel report /
 # profile sync / reply responder / shared connection). All optional with sane

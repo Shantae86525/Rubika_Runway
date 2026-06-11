@@ -156,6 +156,36 @@ def _build_app():
         phone: str
         group_guid: str
 
+    class GenCreateIn(BaseModel):
+        phone: str
+        kind: str = "channel"
+        title: str
+
+    class GenJoinIn(BaseModel):
+        phone: str
+        link: str
+
+    class GenAdminIn(BaseModel):
+        phone: str
+        object_guid: str
+        user_guid: str
+
+    class GenLinkIn(BaseModel):
+        phone: str
+        object_guid: str
+
+    class GenSeedIn(BaseModel):
+        phone: str
+        kind: str = "channel"
+        object_guid: str
+        target: int = 300
+        batch: int = 80
+        delay: float = 2.0
+        exclude: list = []
+
+    class GenSelfIn(BaseModel):
+        phone: str
+
     class ChannelCreateIn(BaseModel):
         phone: str
         marker: str
@@ -520,6 +550,63 @@ def _build_app():
             return {"ok": True}
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "error": repr(e)[:160]}
+
+    # ----- generator engine (موتور مولد) -----
+    @app.post("/gen/self")
+    async def gen_self(body: GenSelfIn, authorization: str = Header(None)):
+        _auth(authorization)
+        guid = await account_conn.call(body.phone, rb.get_self_guid, timeout=30)
+        return {"ok": True, "guid": guid}
+
+    @app.post("/gen/create")
+    async def gen_create(body: GenCreateIn, authorization: str = Header(None)):
+        _auth(authorization)
+        async def _do(client):
+            guid = await rb.create_object(client, body.kind, body.title)
+            link = ""
+            try:
+                link = await rb.make_join_link(client, guid)
+            except Exception:
+                link = ""
+            self_guid = await rb.get_self_guid(client)
+            return {"object_guid": guid, "link": link, "creator_guid": self_guid}
+        res = await account_conn.call(body.phone, _do, timeout=120)
+        return {"ok": True, **res}
+
+    @app.post("/gen/join")
+    async def gen_join(body: GenJoinIn, authorization: str = Header(None)):
+        _auth(authorization)
+        async def _do(client):
+            await rb.join_group_by_link(client, body.link)
+            return await rb.get_self_guid(client)
+        try:
+            guid = await account_conn.call(body.phone, _do, timeout=90)
+            return {"ok": True, "guid": guid}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": repr(e)[:160]}
+
+    @app.post("/gen/is_admin")
+    async def gen_is_admin(body: GenAdminIn, authorization: str = Header(None)):
+        _auth(authorization)
+        try:
+            ok = await account_conn.call(body.phone, rb.user_is_admin,
+                                         body.object_guid, body.user_guid, timeout=60)
+            return {"ok": True, "is_admin": bool(ok)}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "is_admin": False, "error": repr(e)[:160]}
+
+    @app.post("/gen/seed")
+    async def gen_seed(body: GenSeedIn, authorization: str = Header(None)):
+        _auth(authorization)
+        async def _do(client):
+            return await rb.seed_object_with_contacts(
+                client, body.kind, body.object_guid, target=body.target,
+                batch=body.batch, delay=body.delay, exclude=set(body.exclude or []))
+        try:
+            added = await account_conn.call(body.phone, _do, timeout=900)
+            return {"ok": True, "added": added}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "added": 0, "error": repr(e)[:160]}
 
     @app.get("/extras/logs")
     async def extras_logs(authorization: str = Header(None)):

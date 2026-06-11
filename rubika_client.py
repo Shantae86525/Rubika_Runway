@@ -947,3 +947,168 @@ async def leave_group(client: Client, group_guid: str):
             lambda: ((), {"object_guid": group_guid}),
         ])
     raise RuntimeError("this rubpy build has no leave_group()")
+
+
+
+# =========================================================================== #
+# ADDITIVE helpers for the GENERATOR engine (موتور مولد). Verified method names
+# against rubpy 7.3.5 via scripts/test_generator.py:
+#   add_channel(title, description, member_guids)
+#   add_group(title, member_guids)            (create a group)
+#   join_group(link) / join_channel_by_link(link)
+#   user_is_admin(object_guid, user_guid)     (check admin status)
+#   add_channel_members / add_group_members
+#   create_join_link(object_guid, ...)        (to invite other accounts)
+# These DO NOT change any existing function.
+# =========================================================================== #
+async def create_group(client: Client, title: str, member_guids: list = None) -> str:
+    """Create a group and return its guid. Tolerant of rubpy version diffs."""
+    fn = getattr(client, "add_group", None) or getattr(client, "create_group", None)
+    if fn is None:
+        raise RuntimeError("this rubpy build has no add_group()/create_group()")
+    members = member_guids or []
+    result = await _try_call(fn, [
+        lambda: ((), {"title": title, "member_guids": members}),
+        lambda: ((title, members), {}),
+        lambda: ((), {"title": title}),
+        lambda: ((title,), {}),
+    ])
+    guid = _guid_of(result) or _channel_guid_of(result)
+    if not guid:
+        raise RuntimeError("group created but its guid was not found in the response")
+    return guid
+
+
+async def create_object(client: Client, kind: str, title: str) -> str:
+    """Create a channel OR group depending on `kind` ('channel'/'group')."""
+    if str(kind).lower() == "group":
+        return await create_group(client, title)
+    return await create_channel(client, title)
+
+
+async def make_join_link(client: Client, object_guid: str) -> str:
+    """Create (or fetch) an invite link for a channel/group so OTHER accounts
+    can join it. Tolerant of rubpy version diffs."""
+    fn = getattr(client, "create_join_link", None)
+    if fn is not None:
+        try:
+            res = await _try_call(fn, [
+                lambda: ((), {"object_guid": object_guid}),
+                lambda: ((object_guid,), {}),
+            ])
+            d = _data_of(res)
+            for key in ("join_link", "invite_link", "link"):
+                if d.get(key):
+                    return d[key]
+            jl = d.get("join_link") or d.get("link")
+            if isinstance(jl, dict):
+                for key in ("join_link", "invite_link", "link", "url"):
+                    if jl.get(key):
+                        return jl[key]
+        except Exception:
+            pass
+    # fall back to get_join_links
+    fn2 = getattr(client, "get_join_links", None)
+    if fn2 is not None:
+        try:
+            res = await _try_call(fn2, [
+                lambda: ((), {"object_guid": object_guid}),
+                lambda: ((object_guid,), {}),
+            ])
+            d = _data_of(res)
+            links = d.get("join_links") or d.get("links") or []
+            if isinstance(links, list) and links:
+                first = links[0]
+                if isinstance(first, dict):
+                    for key in ("join_link", "invite_link", "link", "url"):
+                        if first.get(key):
+                            return first[key]
+                elif isinstance(first, str):
+                    return first
+        except Exception:
+            pass
+    raise RuntimeError("could not create/get a join link for this object")
+
+
+async def user_is_admin(client: Client, object_guid: str, user_guid: str) -> bool:
+    """Return True if user_guid is an admin of object_guid. Tolerant of diffs."""
+    fn = getattr(client, "user_is_admin", None)
+    if fn is not None:
+        try:
+            res = await _try_call(fn, [
+                lambda: ((object_guid, user_guid), {}),
+                lambda: ((), {"object_guid": object_guid, "user_guid": user_guid}),
+            ])
+            if isinstance(res, bool):
+                return res
+            d = _data_of(res)
+            for key in ("is_admin", "user_is_admin", "result"):
+                if isinstance(d.get(key), bool):
+                    return d[key]
+            # some builds return the access list when admin, nothing when not
+            if d.get("access_list") or d.get("admin_access_list"):
+                return True
+        except Exception:
+            pass
+    # fallback: scan the admin members list
+    for name in ("get_channel_admin_members", "get_group_admin_members"):
+        f = getattr(client, name, None)
+        if f is None:
+            continue
+        try:
+            res = await _try_call(f, [
+                lambda: ((object_guid,), {}),
+                lambda: ((), {"channel_guid": object_guid}),
+                lambda: ((), {"group_guid": object_guid}),
+            ])
+            d = _data_of(res)
+            admins = d.get("in_chat_members") or d.get("admins") or d.get("members") or []
+            for a in admins:
+                ad = _data_of(a) if not isinstance(a, str) else {}
+                g = (ad.get("member_guid") or ad.get("object_guid")
+                     or ad.get("user_guid")) if ad else a
+                if g == user_guid:
+                    return True
+            return False
+        except Exception:
+            continue
+    return False
+
+
+async def add_members_to_object(client: Client, kind: str, object_guid: str,
+                                 member_guids: list):
+    """Add members to a channel OR group depending on `kind`."""
+    if not member_guids:
+        return None
+    if str(kind).lower() == "group":
+        fn = getattr(client, "add_group_members", None)
+        if fn is not None:
+            return await _try_call(fn, [
+                lambda: ((object_guid, member_guids), {}),
+                lambda: ((), {"group_guid": object_guid, "member_guids": member_guids}),
+            ])
+    return await add_channel_members(client, object_guid, member_guids)
+
+
+async def seed_object_with_contacts(client: Client, kind: str, object_guid: str,
+                                    target: int = 300, batch: int = 80,
+                                    delay: float = 2.0,
+                                    exclude: set = None) -> int:
+    """Add the account's OWN contacts to a channel/group in chunks, up to
+    `target`. Skips guids in `exclude` (anti-duplicate across accounts).
+    Returns how many were added."""
+    contacts = await get_contacts_full(client)
+    exclude = exclude or set()
+    guids = [c["guid"] for c in contacts
+             if c.get("guid") and c["guid"] not in exclude][:max(0, int(target))]
+    added = 0
+    for i in range(0, len(guids), max(1, int(batch))):
+        chunk = guids[i:i + batch]
+        try:
+            await add_members_to_object(client, kind, object_guid, chunk)
+            added += len(chunk)
+        except Exception:
+            pass
+        if i + batch < len(guids):
+            await asyncio.sleep(delay)
+    return added

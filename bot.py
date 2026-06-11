@@ -249,6 +249,7 @@ def main_menu(owner: bool = True):
          Button.inline("⚙️ سرعت ارسال", b"speed")],
         [Button.inline("🛠 ورکرها", b"workers"),
          Button.inline("💾 بکاپ", b"backup")],
+        [Button.inline("🏭 موتور مولد", b"generator")],
     ]
     if owner:
         rows.append([Button.inline("👥 مدیریت ادمین", b"admins")])
@@ -880,6 +881,12 @@ async def message_router(event):
         await handle_rp_delay(event)
     elif step == "await_psync":
         await handle_psync_input(event)
+    elif step == "await_gen_title":
+        await handle_gen_title(event)
+    elif step == "await_gen_target":
+        await handle_gen_target(event)
+    elif step == "await_gen_wait":
+        await handle_gen_wait(event)
     elif step in ("wk_ip", "wk_port", "wk_user", "wk_pass"):
         await handle_worker_step(event, step)
 
@@ -3350,6 +3357,359 @@ async def automation_shared_join_cb(event):
         f"⏳ {acc['phone']} داره از لیست مشترک ({len(links)}) عضو می‌شه ... "
         "گزارش در گروه لاگ میاد.")
     asyncio.create_task(run_group_join(acc, links))
+
+
+# --------------------------------------------------------------------------- #
+# 🏭 Generator engine (موتور مولد): one account creates a channel/group, the
+# others join it, the owner makes them admins (we poll user_is_admin), then all
+# accounts seed their contacts (sequentially, anti-duplicate). Fully logged.
+# Local accounts go through account_conn; worker accounts via /gen/* endpoints.
+# Never touches the automation logic or the base source.
+# --------------------------------------------------------------------------- #
+async def _gen_self_guid(acc):
+    w = worker.worker_for_account(acc)
+    if w and not worker.is_local(w):
+        res = await worker.api_call(w, "POST", "/gen/self", {"phone": acc["phone"]})
+        return res.get("guid")
+    return await account_conn.call(acc["phone"], rb.get_self_guid, timeout=30)
+
+
+async def _gen_create(acc, kind, title):
+    w = worker.worker_for_account(acc)
+    if w and not worker.is_local(w):
+        res = await worker.api_call(w, "POST", "/gen/create",
+                                    {"phone": acc["phone"], "kind": kind,
+                                     "title": title}, timeout=120)
+        return res.get("object_guid"), res.get("link", ""), res.get("creator_guid")
+
+    async def _do(client):
+        guid = await rb.create_object(client, kind, title)
+        link = ""
+        try:
+            link = await rb.make_join_link(client, guid)
+        except Exception:
+            link = ""
+        self_guid = await rb.get_self_guid(client)
+        return guid, link, self_guid
+    return await account_conn.call(acc["phone"], _do, timeout=120)
+
+
+async def _gen_join(acc, link):
+    w = worker.worker_for_account(acc)
+    if w and not worker.is_local(w):
+        res = await worker.api_call(w, "POST", "/gen/join",
+                                    {"phone": acc["phone"], "link": link}, timeout=90)
+        if not res.get("ok"):
+            raise RuntimeError(res.get("error", "join failed"))
+        return res.get("guid")
+
+    async def _do(client):
+        await rb.join_group_by_link(client, link)
+        return await rb.get_self_guid(client)
+    return await account_conn.call(acc["phone"], _do, timeout=90)
+
+
+async def _gen_is_admin(creator_acc, object_guid, user_guid):
+    """Ask the CREATOR account whether user_guid is admin of the object."""
+    w = worker.worker_for_account(creator_acc)
+    if w and not worker.is_local(w):
+        res = await worker.api_call(w, "POST", "/gen/is_admin",
+                                    {"phone": creator_acc["phone"],
+                                     "object_guid": object_guid,
+                                     "user_guid": user_guid}, timeout=60)
+        return bool(res.get("is_admin"))
+    return await account_conn.call(creator_acc["phone"], rb.user_is_admin,
+                                   object_guid, user_guid, timeout=60)
+
+
+async def _gen_seed(acc, kind, object_guid, target, exclude):
+    w = worker.worker_for_account(acc)
+    if w and not worker.is_local(w):
+        res = await worker.api_call(w, "POST", "/gen/seed",
+                                    {"phone": acc["phone"], "kind": kind,
+                                     "object_guid": object_guid, "target": target,
+                                     "batch": config.CHANNEL_ADD_BATCH,
+                                     "delay": config.CHANNEL_ADD_DELAY,
+                                     "exclude": list(exclude)}, timeout=900)
+        return res.get("added", 0)
+
+    async def _do(client):
+        return await rb.seed_object_with_contacts(
+            client, kind, object_guid, target=target,
+            batch=config.CHANNEL_ADD_BATCH, delay=config.CHANNEL_ADD_DELAY,
+            exclude=exclude)
+    return await account_conn.call(acc["phone"], _do, timeout=900)
+
+
+def generator_menu_text():
+    g = db.get_generator()
+    creator = db.get_account(g["creator_id"]) if g.get("creator_id") else None
+    return card("🏭 موتور مولد", [
+        f"نوع : {'گروه' if g.get('kind') == 'group' else 'کانال'}",
+        f"اسم : {g.get('title') or '—'}",
+        f"سازنده : {creator['phone'] if creator else '—'}",
+        f"سقف عضوگیری (هر اکانت) : {g.get('member_target')}",
+        f"مهلت انتظار ادمین : {g.get('admin_wait')} ثانیه",
+        LINE,
+        "ربات می‌سازه → بقیه عضو می‌شن → تو دستی ادمینشون کن → "
+        "ربات چک می‌کنه → بعد عضوگیری مخاطبین.",
+    ])
+
+
+def generator_menu_buttons():
+    return [
+        [Button.inline("🔀 نوع (کانال/گروه)", b"gen_kind"),
+         Button.inline("✏️ اسم", b"gen_title")],
+        [Button.inline("👤 اکانت سازنده", b"gen_creator"),
+         Button.inline("🎯 سقف عضوگیری", b"gen_target")],
+        [Button.inline("⏱ مهلت انتظار ادمین", b"gen_wait")],
+        [Button.inline("▶️ شروع موتور مولد", b"gen_start")],
+        [Button.inline("🔙 بازگشت", b"home")],
+    ]
+
+
+@bot.on(events.CallbackQuery(data=b"generator"))
+async def generator_menu_cb(event):
+    if not is_owner(event):
+        return
+    state.pop(event.sender_id, None)
+    await safe_edit(event, generator_menu_text(), buttons=generator_menu_buttons())
+
+
+@bot.on(events.CallbackQuery(data=b"gen_kind"))
+async def gen_kind_cb(event):
+    if not is_owner(event):
+        return
+    g = db.get_generator()
+    db.set_generator(kind=("group" if g.get("kind") == "channel" else "channel"))
+    await generator_menu_cb(event)
+
+
+@bot.on(events.CallbackQuery(data=b"gen_title"))
+async def gen_title_cb(event):
+    if not is_owner(event):
+        return
+    state[event.sender_id] = {"step": "await_gen_title"}
+    await safe_edit(event, "✏️ اسم کانال/گروه رو بفرست:",
+                    buttons=[[Button.inline("🔙 بازگشت", b"generator")]])
+
+
+async def handle_gen_title(event):
+    title = event.raw_text.strip()
+    if not title:
+        await event.respond("اسم خالیه. دوباره بفرست.")
+        return
+    db.set_generator(title=title)
+    state.pop(event.sender_id, None)
+    await event.respond(f"✅ اسم روی «{title}» تنظیم شد.",
+                        buttons=[[Button.inline("🔙 بازگشت", b"generator")]])
+
+
+@bot.on(events.CallbackQuery(data=b"gen_creator"))
+async def gen_creator_cb(event):
+    if not is_owner(event):
+        return
+    accounts = db.list_accounts()
+    if not accounts:
+        await event.answer("اول یک اکانت اضافه کن.", alert=True)
+        return
+    rows = [[Button.inline(f"👤 {a['phone']}", f"gencr_{a['id']}".encode())]
+            for a in accounts]
+    rows.append([Button.inline("🔙 بازگشت", b"generator")])
+    await safe_edit(event, "👤 اکانتِ سازنده‌ی کانال/گروه رو انتخاب کن:", buttons=rows)
+
+
+@bot.on(events.CallbackQuery(pattern=b"gencr_(\\d+)"))
+async def gen_creator_set_cb(event):
+    if not is_owner(event):
+        return
+    db.set_generator(creator_id=int(event.pattern_match.group(1)))
+    await generator_menu_cb(event)
+
+
+@bot.on(events.CallbackQuery(data=b"gen_target"))
+async def gen_target_cb(event):
+    if not is_owner(event):
+        return
+    state[event.sender_id] = {"step": "await_gen_target"}
+    await safe_edit(event, "🎯 سقفِ عضوگیری برای هر اکانت رو بفرست (عدد، مثلاً 300):",
+                    buttons=[[Button.inline("🔙 بازگشت", b"generator")]])
+
+
+async def handle_gen_target(event):
+    try:
+        n = max(1, int(event.raw_text.strip()))
+    except ValueError:
+        await event.respond("یه عدد بفرست.")
+        return
+    db.set_generator(member_target=n)
+    state.pop(event.sender_id, None)
+    await event.respond(f"✅ سقف عضوگیری روی {n} تنظیم شد.",
+                        buttons=[[Button.inline("🔙 بازگشت", b"generator")]])
+
+
+@bot.on(events.CallbackQuery(data=b"gen_wait"))
+async def gen_wait_cb(event):
+    if not is_owner(event):
+        return
+    state[event.sender_id] = {"step": "await_gen_wait"}
+    await safe_edit(event, "⏱ مهلتِ انتظار برای ادمین‌شدن رو به ثانیه بفرست (مثلاً 600):",
+                    buttons=[[Button.inline("🔙 بازگشت", b"generator")]])
+
+
+async def handle_gen_wait(event):
+    try:
+        n = max(30, int(event.raw_text.strip()))
+    except ValueError:
+        await event.respond("یه عدد (ثانیه) بفرست.")
+        return
+    db.set_generator(admin_wait=n)
+    state.pop(event.sender_id, None)
+    await event.respond(f"✅ مهلت انتظار ادمین روی {n} ثانیه تنظیم شد.",
+                        buttons=[[Button.inline("🔙 بازگشت", b"generator")]])
+
+
+@bot.on(events.CallbackQuery(data=b"gen_start"))
+async def gen_start_cb(event):
+    if not is_owner(event):
+        return
+    g = db.get_generator()
+    if not g.get("title"):
+        await event.answer("اول اسم رو تنظیم کن.", alert=True)
+        return
+    if not g.get("creator_id") or not db.get_account(g["creator_id"]):
+        await event.answer("اول اکانتِ سازنده رو انتخاب کن.", alert=True)
+        return
+    if len(db.list_accounts()) < 1:
+        await event.answer("هیچ اکانتی نیست.", alert=True)
+        return
+    await safe_edit(event,
+        "🏭 موتور مولد شروع شد. مراحل و گزارش‌ها در گروه لاگ میاد.\n"
+        "وقتی بقیه اکانت‌ها عضو شدن، خودت دستی ادمینشون کن؛ ربات خودکار چک می‌کنه.",
+        buttons=[[Button.inline("🏠 منوی اصلی", b"home")]])
+    asyncio.create_task(run_generator(event.sender_id))
+
+
+async def run_generator(owner_id: int):
+    g = db.get_generator()
+    kind = g.get("kind") or "channel"
+    title = g.get("title")
+    creator = db.get_account(g["creator_id"])
+    member_target = int(g.get("member_target") or config.CHANNEL_MEMBER_TARGET)
+    admin_wait = int(g.get("admin_wait") or 600)
+    kind_fa = "گروه" if kind == "group" else "کانال"
+
+    if not creator:
+        await log("🏭 موتور مولد: اکانتِ سازنده پیدا نشد.")
+        return
+
+    others = [a for a in db.list_accounts() if a["id"] != creator["id"]]
+
+    # ---- phase 1: create ----
+    try:
+        object_guid, link, creator_guid = await _gen_create(creator, kind, title)
+    except account_conn.InvalidAuthError:
+        await _log_invalid_auth(creator["phone"])
+        return
+    except Exception as e:  # noqa: BLE001
+        await log(card("🏭 موتور مولد — خطا در ساخت", [
+            f"👤 سازنده : {creator['phone']}", f"💥 {repr(e)[:160]}", f"🕒 {now()}"]))
+        return
+    await log(card(f"🏭 موتور مولد — {kind_fa} ساخته شد ✅", [
+        f"🎛 {kind_fa} : {title}",
+        f"🆔 {object_guid}",
+        f"👤 سازنده : {creator['phone']}",
+        (f"🔗 لینک : {link}" if link else "⚠️ لینک دعوت گرفته نشد"),
+        f"🕒 {now()}"]))
+
+    # ---- phase 2: others join (sequential) ----
+    joined = []           # list of (acc, guid)
+    if link:
+        for acc in others:
+            try:
+                guid = await _gen_join(acc, link)
+                joined.append((acc, guid))
+                await log(card("🏭 موتور مولد — عضو شد", [
+                    f"👤 {acc['phone']}", f"🆔 {guid}", f"🕒 {now()}"]))
+            except account_conn.InvalidAuthError:
+                await _log_invalid_auth(acc["phone"])
+            except Exception as e:  # noqa: BLE001
+                await log(card("🏭 موتور مولد — عضویت ناموفق", [
+                    f"👤 {acc['phone']}", f"💥 {repr(e)[:140]}", f"🕒 {now()}"]))
+            await asyncio.sleep(config.GENERATOR_JOIN_DELAY)
+    else:
+        await log("🏭 موتور مولد: چون لینک دعوت نداریم، بقیه اکانت‌ها خودکار عضو نشدن. "
+                  "خودت دستی عضو و ادمینشون کن، بعد عضوگیری انجام می‌شه.")
+
+    # ---- phase 3: wait for the owner to make joined accounts admin ----
+    await log(card("🏭 موتور مولد — منتظر ادمین‌شدن ⏳", [
+        f"تعداد اکانتِ عضو : {len(joined)}",
+        "حالا خودت این اکانت‌ها رو دستی ادمینِ کانال/گروه کن.",
+        f"مهلت : {admin_wait} ثانیه",
+        f"🕒 {now()}"]))
+
+    admin_ok = []          # accounts confirmed admin
+    waited = 0
+    pending = list(joined)
+    while pending and waited < admin_wait:
+        await asyncio.sleep(config.GENERATOR_ADMIN_POLL)
+        waited += config.GENERATOR_ADMIN_POLL
+        still = []
+        for acc, guid in pending:
+            try:
+                is_admin = await _gen_is_admin(creator, object_guid, guid)
+            except Exception:
+                is_admin = False
+            if is_admin:
+                admin_ok.append((acc, guid))
+                await log(card("🏭 موتور مولد — ادمین شد ✅", [
+                    f"👤 {acc['phone']}", f"🕒 {now()}"]))
+            else:
+                still.append((acc, guid))
+        pending = still
+
+    if pending:
+        await log(card("🏭 موتور مولد — مهلت ادمین تمام شد", [
+            f"✅ ادمین‌شده : {len(admin_ok)}",
+            f"⌛ بدون ادمین : {len(pending)} (این‌ها عضوگیری نمی‌کنن)",
+            f"🕒 {now()}"]))
+
+    # ---- phase 4: seed members (creator + admins), sequential, anti-duplicate
+    seeders = [(creator, creator_guid)] + admin_ok
+    total_added = 0
+    seen_contacts: set = set()
+    for acc, _guid in seeders:
+        try:
+            added = await _gen_seed(acc, kind, object_guid, member_target,
+                                    seen_contacts)
+            total_added += added
+            await log(card("🏭 موتور مولد — عضوگیری", [
+                f"👤 {acc['phone']}",
+                f"➕ اضافه‌شده : {added}",
+                f"🕒 {now()}"]))
+        except account_conn.InvalidAuthError:
+            await _log_invalid_auth(acc["phone"])
+        except Exception as e:  # noqa: BLE001
+            await log(card("🏭 موتور مولد — عضوگیری ناموفق", [
+                f"👤 {acc['phone']}", f"💥 {repr(e)[:140]}", f"🕒 {now()}"]))
+        await asyncio.sleep(config.GENERATOR_JOIN_DELAY)
+
+    # ---- final report ----
+    await log(card("🏭 موتور مولد — پایان ✅", [
+        f"🎛 {kind_fa} : {title}",
+        f"🆔 {object_guid}",
+        f"👥 اکانتِ عضو : {len(joined)}",
+        f"🛡 ادمین‌شده : {len(admin_ok)}",
+        f"➕ کلِ ممبرِ اضافه‌شده : {total_added}",
+        f"🕒 {now()}"]))
+    try:
+        await bot.send_message(owner_id,
+                               f"🏭 موتور مولد تمام شد.\n{kind_fa}: {title}\n"
+                               f"عضو: {len(joined)} | ادمین: {len(admin_ok)} | "
+                               f"ممبر اضافه‌شده: {total_added}",
+                               buttons=main_menu(owner_id == config.OWNER_ID))
+    except Exception:
+        pass
 
 
 # --------------------------------------------------------------------------- #

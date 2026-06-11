@@ -992,3 +992,65 @@ def clear_cleanup_candidates(account_id: int):
                  (int(account_id),))
     conn.commit()
     conn.close()
+
+
+
+# --------------------------------------------------------------------------- #
+# Generator engine (موتور مولد): single-row config + last result.
+# Builds a channel/group with one account, joins the others, waits for the
+# owner to make them admins, then seeds members. All additive.
+# --------------------------------------------------------------------------- #
+def _ensure_generator_table():
+    conn = _conn()
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS generator (
+            id            INTEGER PRIMARY KEY CHECK (id = 1),
+            kind          TEXT DEFAULT 'channel',   -- 'channel' or 'group'
+            title         TEXT DEFAULT '',
+            creator_id    INTEGER,                  -- account_id of the creator
+            member_target INTEGER DEFAULT 300,      -- per-account member cap
+            admin_wait    INTEGER DEFAULT 600,      -- seconds to wait for admin
+            updated_at    TEXT
+        )
+        """
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO generator (id, kind, title, member_target, admin_wait) "
+        "VALUES (1, 'channel', '', ?, ?)",
+        (config.CHANNEL_MEMBER_TARGET, 600),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_generator() -> dict:
+    _ensure_generator_table()
+    conn = _conn()
+    row = conn.execute("SELECT * FROM generator WHERE id = 1").fetchone()
+    conn.close()
+    return dict(row) if row else {"kind": "channel", "title": "", "creator_id": None,
+                                  "member_target": config.CHANNEL_MEMBER_TARGET,
+                                  "admin_wait": 600}
+
+
+def set_generator(**fields):
+    """Update any subset of generator config fields."""
+    if not fields:
+        return
+    _ensure_generator_table()
+    allowed = {"kind", "title", "creator_id", "member_target", "admin_wait"}
+    sets = []
+    vals = []
+    for k, v in fields.items():
+        if k in allowed:
+            sets.append(f"{k} = ?")
+            vals.append(v)
+    if not sets:
+        return
+    sets.append("updated_at = ?")
+    vals.append(_now())
+    conn = _conn()
+    conn.execute(f"UPDATE generator SET {', '.join(sets)} WHERE id = 1", vals)
+    conn.commit()
+    conn.close()
