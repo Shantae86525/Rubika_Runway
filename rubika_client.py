@@ -962,11 +962,20 @@ async def leave_group(client: Client, group_guid: str):
 # These DO NOT change any existing function.
 # =========================================================================== #
 async def create_group(client: Client, title: str, member_guids: list = None) -> str:
-    """Create a group and return its guid. Tolerant of rubpy version diffs."""
+    """Create a group and return its guid. Tolerant of rubpy version diffs.
+
+    Rubika's addGroup REQUIRES at least one member guid; sending an empty list
+    returns INVALID_INPUT. So if no members are given we seed the group with the
+    account ITSELF (the verified test created a group exactly this way)."""
     fn = getattr(client, "add_group", None) or getattr(client, "create_group", None)
     if fn is None:
         raise RuntimeError("this rubpy build has no add_group()/create_group()")
-    members = member_guids or []
+    members = list(member_guids or [])
+    if not members:
+        try:
+            members = [await get_self_guid(client)]
+        except Exception:
+            members = []
     result = await _try_call(fn, [
         lambda: ((), {"title": title, "member_guids": members}),
         lambda: ((title, members), {}),
