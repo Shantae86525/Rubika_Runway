@@ -33,6 +33,19 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import rubika_client as rb  # noqa: E402
 
 
+async def _try_call(fn, attempts):
+    """Call fn trying several arg shapes; return first non-TypeError result."""
+    last = None
+    for make in attempts:
+        a, k = make()
+        try:
+            return await fn(*a, **k)
+        except TypeError as e:
+            last = e
+            continue
+    raise RuntimeError(f"signature mismatch: {last}")
+
+
 # method-name candidates we care about, grouped by the engine step
 CANDIDATES = {
     "create_channel": ["add_channel", "create_channel"],
@@ -117,21 +130,79 @@ async def main():
                   "make a throwaway channel and test the admin/join wiring.")
             return
 
-        # ---- optional: create a throwaway channel and probe admin/join -----
+        # ---- optional: create throwaway channel + group, probe make-admin --
         print("\n" + "=" * 60)
-        print("CREATE a throwaway channel to probe wiring (--create)")
+        print("CREATE throwaway channel + group and probe set_group_admin (--create)")
         print("=" * 60)
-        title = "تست موتور (پاک کن)"
+
+        # our OWN guid is used as the member to (try to) promote — harmless,
+        # we're already the owner; it just proves the method accepts a channel
+        # guid vs a group guid without error.
         try:
-            guid = await rb.create_channel(client, title)
-            print(f"   ✅ channel created: {guid}")
+            self_guid = await rb.get_self_guid(client)
+            print(f"   self guid: {self_guid}")
         except Exception as e:  # noqa: BLE001
-            print(f"   ❌ create_channel failed: {e!r}")
+            print(f"   ❌ could not get self guid: {e!r}")
             return
-        print("   ℹ️ این کانالِ تستی رو خودت دستی پاک کن.")
-        # we do NOT auto-make-admin or auto-add here, because that needs a
-        # second account's guid; just report the created guid so we can wire
-        # the real engine against confirmed method names.
+
+        # full admin access list (rubpy accepts a list of access strings)
+        access = ["SetAdmin", "ChangeInfo", "PinMessages", "DeleteGlobalAllMessages",
+                  "BanMember", "SetJoinLink", "SetMemberAccess", "AddMember"]
+
+        async def _try_set_admin(obj_guid, label):
+            fn = getattr(client, "set_group_admin", None)
+            if fn is None:
+                print(f"   [{label}] ❌ set_group_admin missing")
+                return
+            attempts = [
+                lambda: ((), {"group_guid": obj_guid, "member_guid": self_guid,
+                              "action": "SetAdmin", "access_list": access}),
+                lambda: ((obj_guid, self_guid, "SetAdmin", access), {}),
+                lambda: ((), {"object_guid": obj_guid, "member_guid": self_guid,
+                              "action": "SetAdmin", "access_list": access}),
+            ]
+            for mk in attempts:
+                a, k = mk()
+                try:
+                    res = await fn(*a, **k)
+                    print(f"   [{label}] ✅ set_group_admin worked -> "
+                          f"{rb._data_of(res) or 'OK'}")
+                    return
+                except TypeError:
+                    continue
+                except Exception as e:  # noqa: BLE001
+                    print(f"   [{label}] ⚠️ set_group_admin error: {e!r}")
+                    return
+            print(f"   [{label}] ❌ no argument shape matched")
+
+        # 1) channel
+        try:
+            ch_guid = await rb.create_channel(client, "تست کانال موتور (پاک کن)")
+            print(f"   ✅ channel created: {ch_guid}")
+            await _try_set_admin(ch_guid, "CHANNEL")
+        except Exception as e:  # noqa: BLE001
+            print(f"   ❌ create channel failed: {e!r}")
+
+        # 2) group — find the create-group method
+        grp_fn = (getattr(client, "add_group", None)
+                  or getattr(client, "create_group", None))
+        if grp_fn is None:
+            print("   ❌ no add_group()/create_group() on this build")
+        else:
+            try:
+                res = await _try_call(grp_fn, [
+                    lambda: ((), {"title": "تست گروه موتور (پاک کن)",
+                                  "member_guids": [self_guid]}),
+                    lambda: (("تست گروه موتور (پاک کن)", [self_guid]), {}),
+                ])
+                g_guid = rb._guid_of(res) or rb._channel_guid_of(res)
+                print(f"   ✅ group created: {g_guid}")
+                if g_guid:
+                    await _try_set_admin(g_guid, "GROUP")
+            except Exception as e:  # noqa: BLE001
+                print(f"   ❌ create group failed: {e!r}")
+
+        print("\n   ℹ️ کانال و گروهِ تستی رو خودت دستی پاک کن.")
     finally:
         try:
             await client.disconnect()
