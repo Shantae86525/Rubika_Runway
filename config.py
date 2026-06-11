@@ -70,7 +70,7 @@ AUTOMATION_SUMMARY_INTERVAL = _int("AUTOMATION_SUMMARY_INTERVAL", 1200)  # 20 mi
 
 # Health & self-heal engine: how often (seconds) it runs a full system pass
 # (verify sessions, relaunch stalled automations, post the overall health card).
-HEALTH_ENGINE_INTERVAL = _int("HEALTH_ENGINE_INTERVAL", 3600)  # 1 hour
+HEALTH_ENGINE_INTERVAL = _int("HEALTH_ENGINE_INTERVAL", 10800)  # 3 hours
 # Auto-deactivate an account whose session the engine finds dead (only flags
 # inactive + stops its features; never deletes — deletion stays manual).
 HEALTH_ENGINE_AUTODISABLE_DEAD = (os.getenv("HEALTH_ENGINE_AUTODISABLE_DEAD",
