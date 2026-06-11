@@ -1054,3 +1054,103 @@ def set_generator(**fields):
     conn.execute(f"UPDATE generator SET {', '.join(sets)} WHERE id = 1", vals)
     conn.commit()
     conn.close()
+
+
+
+# --------------------------------------------------------------------------- #
+# Channel-broadcast engine (پخش کانالی / موتور مولد جدید): selected accounts
+# EACH create their OWN channel (shared title), forward the marked post into
+# it, then seed their OWN contacts. Config is a single row + a set of selected
+# account ids. (Rubika doesn't let channel admins add members, so the old
+# shared-channel/admin model is replaced by this per-account model.)
+# --------------------------------------------------------------------------- #
+def _ensure_broadcaster_tables():
+    conn = _conn()
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS broadcaster (
+            id            INTEGER PRIMARY KEY CHECK (id = 1),
+            title         TEXT DEFAULT '',
+            username_seed TEXT DEFAULT 'ch',
+            member_target INTEGER DEFAULT 300,
+            gap_seconds   INTEGER DEFAULT 8,
+            updated_at    TEXT
+        )
+        """
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO broadcaster (id, title, username_seed, member_target, "
+        "gap_seconds) VALUES (1, '', 'ch', ?, 8)",
+        (config.CHANNEL_MEMBER_TARGET,),
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS broadcaster_accounts (
+            account_id INTEGER PRIMARY KEY
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_broadcaster() -> dict:
+    _ensure_broadcaster_tables()
+    conn = _conn()
+    row = conn.execute("SELECT * FROM broadcaster WHERE id = 1").fetchone()
+    conn.close()
+    return dict(row) if row else {"title": "", "username_seed": "ch",
+                                  "member_target": config.CHANNEL_MEMBER_TARGET,
+                                  "gap_seconds": 8}
+
+
+def set_broadcaster(**fields):
+    if not fields:
+        return
+    _ensure_broadcaster_tables()
+    allowed = {"title", "username_seed", "member_target", "gap_seconds"}
+    sets, vals = [], []
+    for k, v in fields.items():
+        if k in allowed:
+            sets.append(f"{k} = ?")
+            vals.append(v)
+    if not sets:
+        return
+    sets.append("updated_at = ?")
+    vals.append(_now())
+    conn = _conn()
+    conn.execute(f"UPDATE broadcaster SET {', '.join(sets)} WHERE id = 1", vals)
+    conn.commit()
+    conn.close()
+
+
+def toggle_broadcaster_account(account_id: int) -> bool:
+    """Add/remove an account from the broadcast selection. Returns new state
+    (True = now selected)."""
+    _ensure_broadcaster_tables()
+    conn = _conn()
+    row = conn.execute("SELECT 1 FROM broadcaster_accounts WHERE account_id = ?",
+                       (int(account_id),)).fetchone()
+    if row:
+        conn.execute("DELETE FROM broadcaster_accounts WHERE account_id = ?",
+                     (int(account_id),))
+        new_state = False
+    else:
+        conn.execute("INSERT OR IGNORE INTO broadcaster_accounts (account_id) VALUES (?)",
+                     (int(account_id),))
+        new_state = True
+    conn.commit()
+    conn.close()
+    return new_state
+
+
+def list_broadcaster_account_ids() -> list:
+    _ensure_broadcaster_tables()
+    conn = _conn()
+    rows = conn.execute("SELECT account_id FROM broadcaster_accounts").fetchall()
+    conn.close()
+    return [int(r["account_id"]) for r in rows]
+
+
+def is_broadcaster_account(account_id: int) -> bool:
+    return int(account_id) in set(list_broadcaster_account_ids())

@@ -250,6 +250,7 @@ def main_menu(owner: bool = True):
         [Button.inline("🛠 ورکرها", b"workers"),
          Button.inline("💾 بکاپ", b"backup")],
         [Button.inline("🏭 موتور مولد", b"generator")],
+        [Button.inline("🖼 آرشیو عکس پیوی (PDF)", b"pvexport")],
     ]
     if owner:
         rows.append([Button.inline("👥 مدیریت ادمین", b"admins")])
@@ -881,12 +882,12 @@ async def message_router(event):
         await handle_rp_delay(event)
     elif step == "await_psync":
         await handle_psync_input(event)
-    elif step == "await_gen_title":
-        await handle_gen_title(event)
-    elif step == "await_gen_target":
-        await handle_gen_target(event)
-    elif step == "await_gen_wait":
-        await handle_gen_wait(event)
+    elif step == "await_bc_title":
+        await handle_bc_title(event)
+    elif step == "await_bc_target":
+        await handle_bc_target(event)
+    elif step == "await_bc_gap":
+        await handle_bc_gap(event)
     elif step in ("wk_ip", "wk_port", "wk_user", "wk_pass"):
         await handle_worker_step(event, step)
 
@@ -3366,108 +3367,27 @@ async def automation_shared_join_cb(event):
 # Local accounts go through account_conn; worker accounts via /gen/* endpoints.
 # Never touches the automation logic or the base source.
 # --------------------------------------------------------------------------- #
-async def _gen_self_guid(acc):
-    w = worker.worker_for_account(acc)
-    if w and not worker.is_local(w):
-        res = await worker.api_call(w, "POST", "/gen/self", {"phone": acc["phone"]})
-        return res.get("guid")
-    return await account_conn.call(acc["phone"], rb.get_self_guid, timeout=30)
-
-
-async def _gen_create(acc, kind, title):
-    """Create a CHANNEL, give it a random public username (so others can join
-    by username — private invite links don't work reliably for joining), and
-    return (channel_guid, username, creator_guid). `kind` is kept for signature
-    compatibility but the generator is channel-only."""
-    w = worker.worker_for_account(acc)
-    if w and not worker.is_local(w):
-        res = await worker.api_call(w, "POST", "/gen/create",
-                                    {"phone": acc["phone"], "kind": "channel",
-                                     "title": title}, timeout=120)
-        return res.get("object_guid"), res.get("username", ""), res.get("creator_guid")
-
-    async def _do(client):
-        guid = await rb.create_channel(client, title)
-        username = ""
-        try:
-            username = await rb.assign_random_channel_username(client, guid)
-        except Exception:
-            username = ""
-        self_guid = await rb.get_self_guid(client)
-        return guid, username, self_guid
-    return await account_conn.call(acc["phone"], _do, timeout=120)
-
-
-async def _gen_join(acc, username):
-    """Join the channel by its public username (verified working method)."""
-    w = worker.worker_for_account(acc)
-    if w and not worker.is_local(w):
-        res = await worker.api_call(w, "POST", "/gen/join",
-                                    {"phone": acc["phone"], "username": username},
-                                    timeout=90)
-        if not res.get("ok"):
-            raise RuntimeError(res.get("error", "join failed"))
-        return res.get("guid")
-
-    async def _do(client):
-        guid = await rb.join_channel_by_username(client, username)
-        return guid
-    return await account_conn.call(acc["phone"], _do, timeout=90)
-
-
-async def _gen_is_admin(creator_acc, object_guid, user_guid):
-    """Ask the CREATOR account whether user_guid is admin of the object."""
-    w = worker.worker_for_account(creator_acc)
-    if w and not worker.is_local(w):
-        res = await worker.api_call(w, "POST", "/gen/is_admin",
-                                    {"phone": creator_acc["phone"],
-                                     "object_guid": object_guid,
-                                     "user_guid": user_guid}, timeout=60)
-        return bool(res.get("is_admin"))
-    return await account_conn.call(creator_acc["phone"], rb.user_is_admin,
-                                   object_guid, user_guid, timeout=60)
-
-
-async def _gen_seed(acc, kind, object_guid, target, exclude):
-    w = worker.worker_for_account(acc)
-    if w and not worker.is_local(w):
-        res = await worker.api_call(w, "POST", "/gen/seed",
-                                    {"phone": acc["phone"], "kind": kind,
-                                     "object_guid": object_guid, "target": target,
-                                     "batch": config.CHANNEL_ADD_BATCH,
-                                     "delay": config.CHANNEL_ADD_DELAY,
-                                     "exclude": list(exclude)}, timeout=900)
-        return res.get("added", 0)
-
-    async def _do(client):
-        return await rb.seed_object_with_contacts(
-            client, kind, object_guid, target=target,
-            batch=config.CHANNEL_ADD_BATCH, delay=config.CHANNEL_ADD_DELAY,
-            exclude=exclude)
-    return await account_conn.call(acc["phone"], _do, timeout=900)
-
-
 def generator_menu_text():
-    g = db.get_generator()
-    creator = db.get_account(g["creator_id"]) if g.get("creator_id") else None
-    return card("🏭 موتور مولد (کانال)", [
-        f"اسم کانال : {g.get('title') or '—'}",
-        f"سازنده : {creator['phone'] if creator else '—'}",
-        f"سقف عضوگیری (هر اکانت) : {g.get('member_target')}",
-        f"مهلت انتظار ادمین : {g.get('admin_wait')} ثانیه",
+    b = db.get_broadcaster()
+    sel = db.list_broadcaster_account_ids()
+    return card("📢 پخش کانالی (موتور مولد)", [
+        f"اسم مشترک کانال‌ها : {b.get('title') or '—'}",
+        f"اکانت‌های انتخاب‌شده : {len(sel)}",
+        f"سقف عضوگیری (هر کانال) : {b.get('member_target')}",
+        f"فاصله بین اکانت‌ها : {b.get('gap_seconds')} ثانیه",
         LINE,
-        "ربات کانال می‌سازه + یوزرنیم رندوم → بقیه اکانت‌ها با یوزرنیم عضو می‌شن "
-        "→ تو دستی ادمینشون کن → ربات چک می‌کنه → بعد عضوگیری مخاطبین.",
+        "هر اکانتِ انتخابی، کانالِ خودش رو می‌سازه (با اسم مشترک + یوزرنیم رندوم)، "
+        "پیامِ مارکر رو می‌فرسته، و مخاطبینِ خودش رو عضو می‌کنه. نوبتی + لاگ کامل.",
     ])
 
 
 def generator_menu_buttons():
     return [
-        [Button.inline("✏️ اسم کانال", b"gen_title")],
-        [Button.inline("👤 اکانت سازنده", b"gen_creator"),
-         Button.inline("🎯 سقف عضوگیری", b"gen_target")],
-        [Button.inline("⏱ مهلت انتظار ادمین", b"gen_wait")],
-        [Button.inline("▶️ شروع موتور مولد", b"gen_start")],
+        [Button.inline("✏️ اسم مشترک کانال", b"bc_title")],
+        [Button.inline("👥 انتخاب اکانت‌ها", b"bc_accounts"),
+         Button.inline("🎯 سقف عضوگیری", b"bc_target")],
+        [Button.inline("⏱ فاصله بین اکانت‌ها", b"bc_gap")],
+        [Button.inline("▶️ شروع پخش کانالی", b"bc_start")],
         [Button.inline("🔙 بازگشت", b"home")],
     ]
 
@@ -3480,247 +3400,319 @@ async def generator_menu_cb(event):
     await safe_edit(event, generator_menu_text(), buttons=generator_menu_buttons())
 
 
-@bot.on(events.CallbackQuery(data=b"gen_kind"))
-async def gen_kind_cb(event):
+@bot.on(events.CallbackQuery(data=b"bc_title"))
+async def bc_title_cb(event):
     if not is_owner(event):
         return
-    g = db.get_generator()
-    db.set_generator(kind=("group" if g.get("kind") == "channel" else "channel"))
-    await generator_menu_cb(event)
-
-
-@bot.on(events.CallbackQuery(data=b"gen_title"))
-async def gen_title_cb(event):
-    if not is_owner(event):
-        return
-    state[event.sender_id] = {"step": "await_gen_title"}
-    await safe_edit(event, "✏️ اسم کانال/گروه رو بفرست:",
+    state[event.sender_id] = {"step": "await_bc_title"}
+    await safe_edit(event, "✏️ اسمِ مشترکِ کانال‌ها رو بفرست (همه‌ی کانال‌ها این اسم رو می‌گیرن):",
                     buttons=[[Button.inline("🔙 بازگشت", b"generator")]])
 
 
-async def handle_gen_title(event):
+async def handle_bc_title(event):
     title = event.raw_text.strip()
     if not title:
         await event.respond("اسم خالیه. دوباره بفرست.")
         return
-    db.set_generator(title=title)
+    db.set_broadcaster(title=title)
     state.pop(event.sender_id, None)
-    await event.respond(f"✅ اسم روی «{title}» تنظیم شد.",
+    await event.respond(f"✅ اسم مشترک روی «{title}» تنظیم شد.",
                         buttons=[[Button.inline("🔙 بازگشت", b"generator")]])
 
 
-@bot.on(events.CallbackQuery(data=b"gen_creator"))
-async def gen_creator_cb(event):
+@bot.on(events.CallbackQuery(data=b"bc_accounts"))
+async def bc_accounts_cb(event):
     if not is_owner(event):
         return
     accounts = db.list_accounts()
     if not accounts:
         await event.answer("اول یک اکانت اضافه کن.", alert=True)
         return
-    rows = [[Button.inline(f"👤 {a['phone']}", f"gencr_{a['id']}".encode())]
-            for a in accounts]
+    sel = set(db.list_broadcaster_account_ids())
+    rows = []
+    for a in accounts:
+        mark = "✅" if a["id"] in sel else "⬜️"
+        rows.append([Button.inline(f"{mark} {a['phone']}",
+                                   f"bcacc_{a['id']}".encode())])
     rows.append([Button.inline("🔙 بازگشت", b"generator")])
-    await safe_edit(event, "👤 اکانتِ سازنده‌ی کانال/گروه رو انتخاب کن:", buttons=rows)
+    await safe_edit(event, "👥 اکانت‌هایی که کانال می‌سازن رو انتخاب کن (بزن تا تیک بخوره):",
+                    buttons=rows)
 
 
-@bot.on(events.CallbackQuery(pattern=b"gencr_(\\d+)"))
-async def gen_creator_set_cb(event):
+@bot.on(events.CallbackQuery(pattern=b"bcacc_(\\d+)"))
+async def bc_acc_toggle_cb(event):
     if not is_owner(event):
         return
-    db.set_generator(creator_id=int(event.pattern_match.group(1)))
-    await generator_menu_cb(event)
+    db.toggle_broadcaster_account(int(event.pattern_match.group(1)))
+    await bc_accounts_cb(event)
 
 
-@bot.on(events.CallbackQuery(data=b"gen_target"))
-async def gen_target_cb(event):
+@bot.on(events.CallbackQuery(data=b"bc_target"))
+async def bc_target_cb(event):
     if not is_owner(event):
         return
-    state[event.sender_id] = {"step": "await_gen_target"}
-    await safe_edit(event, "🎯 سقفِ عضوگیری برای هر اکانت رو بفرست (عدد، مثلاً 300):",
+    state[event.sender_id] = {"step": "await_bc_target"}
+    await safe_edit(event, "🎯 سقفِ عضوگیری برای هر کانال رو بفرست (عدد، مثلاً 300):",
                     buttons=[[Button.inline("🔙 بازگشت", b"generator")]])
 
 
-async def handle_gen_target(event):
+async def handle_bc_target(event):
     try:
         n = max(1, int(event.raw_text.strip()))
     except ValueError:
         await event.respond("یه عدد بفرست.")
         return
-    db.set_generator(member_target=n)
+    db.set_broadcaster(member_target=n)
     state.pop(event.sender_id, None)
     await event.respond(f"✅ سقف عضوگیری روی {n} تنظیم شد.",
                         buttons=[[Button.inline("🔙 بازگشت", b"generator")]])
 
 
-@bot.on(events.CallbackQuery(data=b"gen_wait"))
-async def gen_wait_cb(event):
+@bot.on(events.CallbackQuery(data=b"bc_gap"))
+async def bc_gap_cb(event):
     if not is_owner(event):
         return
-    state[event.sender_id] = {"step": "await_gen_wait"}
-    await safe_edit(event, "⏱ مهلتِ انتظار برای ادمین‌شدن رو به ثانیه بفرست (مثلاً 600):",
+    state[event.sender_id] = {"step": "await_bc_gap"}
+    await safe_edit(event, "⏱ فاصله بین اکانت‌ها رو به ثانیه بفرست (مثلاً 8):",
                     buttons=[[Button.inline("🔙 بازگشت", b"generator")]])
 
 
-async def handle_gen_wait(event):
+async def handle_bc_gap(event):
     try:
-        n = max(30, int(event.raw_text.strip()))
+        n = max(1, int(event.raw_text.strip()))
     except ValueError:
         await event.respond("یه عدد (ثانیه) بفرست.")
         return
-    db.set_generator(admin_wait=n)
+    db.set_broadcaster(gap_seconds=n)
     state.pop(event.sender_id, None)
-    await event.respond(f"✅ مهلت انتظار ادمین روی {n} ثانیه تنظیم شد.",
+    await event.respond(f"✅ فاصله روی {n} ثانیه تنظیم شد.",
                         buttons=[[Button.inline("🔙 بازگشت", b"generator")]])
 
 
-@bot.on(events.CallbackQuery(data=b"gen_start"))
-async def gen_start_cb(event):
+@bot.on(events.CallbackQuery(data=b"bc_start"))
+async def bc_start_cb(event):
     if not is_owner(event):
         return
-    g = db.get_generator()
-    if not g.get("title"):
-        await event.answer("اول اسم رو تنظیم کن.", alert=True)
+    b = db.get_broadcaster()
+    sel = db.list_broadcaster_account_ids()
+    if not b.get("title"):
+        await event.answer("اول اسمِ مشترک رو تنظیم کن.", alert=True)
         return
-    if not g.get("creator_id") or not db.get_account(g["creator_id"]):
-        await event.answer("اول اکانتِ سازنده رو انتخاب کن.", alert=True)
-        return
-    if len(db.list_accounts()) < 1:
-        await event.answer("هیچ اکانتی نیست.", alert=True)
+    if not sel:
+        await event.answer("اول حداقل یک اکانت انتخاب کن.", alert=True)
         return
     await safe_edit(event,
-        "🏭 موتور مولد شروع شد. مراحل و گزارش‌ها در گروه لاگ میاد.\n"
-        "وقتی بقیه اکانت‌ها عضو شدن، خودت دستی ادمینشون کن؛ ربات خودکار چک می‌کنه.",
+        f"📢 پخش کانالی شروع شد روی {len(sel)} اکانت. نوبتی و با لاگ کامل پیش می‌ره.",
         buttons=[[Button.inline("🏠 منوی اصلی", b"home")]])
-    asyncio.create_task(run_generator(event.sender_id))
+    asyncio.create_task(run_broadcaster(event.sender_id))
 
 
-async def run_generator(owner_id: int):
-    g = db.get_generator()
-    title = g.get("title")
-    creator = db.get_account(g["creator_id"])
-    member_target = int(g.get("member_target") or config.CHANNEL_MEMBER_TARGET)
-    admin_wait = int(g.get("admin_wait") or 600)
-    kind = "channel"            # generator is channel-only (groups can't be auto-joined)
-    kind_fa = "کانال"
+async def _broadcast_one(acc, title, member_target, marker):
+    """Make this account's OWN channel, set a random username, forward the
+    marked post, then seed its OWN contacts. Local or worker."""
+    w = worker.worker_for_account(acc)
+    if w and not worker.is_local(w):
+        res = await worker.api_call(w, "POST", "/broadcast/run", {
+            "phone": acc["phone"], "title": title, "marker": marker,
+            "member_target": member_target}, timeout=900)
+        if not res.get("ok"):
+            raise RuntimeError(res.get("error", "broadcast failed"))
+        return res.get("object_guid"), res.get("username", ""), \
+            res.get("forwarded", False), res.get("added", 0)
 
-    if not creator:
-        await log("🏭 موتور مولد: اکانتِ سازنده پیدا نشد.")
-        return
-
-    others = [a for a in db.list_accounts() if a["id"] != creator["id"]]
-
-    # ---- phase 1: create channel + random public username ----
-    try:
-        object_guid, username, creator_guid = await _gen_create(creator, kind, title)
-    except account_conn.InvalidAuthError:
-        await _log_invalid_auth(creator["phone"])
-        return
-    except Exception as e:  # noqa: BLE001
-        await log(card("🏭 موتور مولد — خطا در ساخت", [
-            f"👤 سازنده : {creator['phone']}", f"💥 {repr(e)[:160]}", f"🕒 {now()}"]))
-        return
-    if not username:
-        await log(card("🏭 موتور مولد — یوزرنیم ست نشد", [
-            f"🎛 کانال : {title}", f"🆔 {object_guid}",
-            "بدون یوزرنیمِ عمومی، بقیه اکانت‌ها نمی‌تونن خودکار عضو شن.",
-            "خودت دستی یه یوزرنیم برای کانال بذار و اکانت‌ها رو عضو/ادمین کن.",
-            f"🕒 {now()}"]))
-    await log(card("🏭 موتور مولد — کانال ساخته شد ✅", [
-        f"🎛 کانال : {title}",
-        f"🆔 {object_guid}",
-        f"👤 سازنده : {creator['phone']}",
-        (f"🔗 یوزرنیم : @{username}\nhttps://rubika.ir/{username}"
-         if username else "⚠️ یوزرنیم ست نشد"),
-        f"🕒 {now()}"]))
-
-    # ---- phase 2: others join BY USERNAME (sequential) ----
-    joined = []           # list of (acc, guid)
-    if username:
-        for acc in others:
-            try:
-                guid = await _gen_join(acc, username)
-                joined.append((acc, guid))
-                await log(card("🏭 موتور مولد — عضو شد", [
-                    f"👤 {acc['phone']}", f"🆔 {guid}", f"🕒 {now()}"]))
-            except account_conn.InvalidAuthError:
-                await _log_invalid_auth(acc["phone"])
-            except Exception as e:  # noqa: BLE001
-                await log(card("🏭 موتور مولد — عضویت ناموفق", [
-                    f"👤 {acc['phone']}", f"💥 {repr(e)[:140]}", f"🕒 {now()}"]))
-            await asyncio.sleep(config.GENERATOR_JOIN_DELAY)
-    else:
-        await log("🏭 موتور مولد: چون یوزرنیم نداریم، بقیه اکانت‌ها خودکار عضو نشدن. "
-                  "خودت دستی عضو و ادمینشون کن، بعد عضوگیری انجام می‌شه.")
-
-    # ---- phase 3: wait for the owner to make joined accounts admin ----
-    await log(card("🏭 موتور مولد — منتظر ادمین‌شدن ⏳", [
-        f"تعداد اکانتِ عضو : {len(joined)}",
-        "حالا خودت این اکانت‌ها رو دستی ادمینِ کانال کن.",
-        f"مهلت : {admin_wait} ثانیه",
-        f"🕒 {now()}"]))
-
-    admin_ok = []          # accounts confirmed admin
-    waited = 0
-    pending = list(joined)
-    while pending and waited < admin_wait:
-        await asyncio.sleep(config.GENERATOR_ADMIN_POLL)
-        waited += config.GENERATOR_ADMIN_POLL
-        still = []
-        for acc, guid in pending:
-            try:
-                is_admin = await _gen_is_admin(creator, object_guid, guid)
-            except Exception:
-                is_admin = False
-            if is_admin:
-                admin_ok.append((acc, guid))
-                await log(card("🏭 موتور مولد — ادمین شد ✅", [
-                    f"👤 {acc['phone']}", f"🕒 {now()}"]))
-            else:
-                still.append((acc, guid))
-        pending = still
-
-    if pending:
-        await log(card("🏭 موتور مولد — مهلت ادمین تمام شد", [
-            f"✅ ادمین‌شده : {len(admin_ok)}",
-            f"⌛ بدون ادمین : {len(pending)} (این‌ها عضوگیری نمی‌کنن)",
-            f"🕒 {now()}"]))
-
-    # ---- phase 4: seed members (creator + admins), sequential, anti-duplicate
-    seeders = [(creator, creator_guid)] + admin_ok
-    total_added = 0
-    seen_contacts: set = set()
-    for acc, _guid in seeders:
+    async def _do(client):
+        guid = await rb.create_channel(client, title)
+        username = ""
         try:
-            added = await _gen_seed(acc, kind, object_guid, member_target,
-                                    seen_contacts)
+            username = await rb.assign_random_channel_username(client, guid)
+        except Exception:
+            username = ""
+        forwarded = False
+        try:
+            saved_guid, mid = await rb.find_marked_message(client, marker)
+            if mid:
+                await rb.forward_message(client, saved_guid, guid, mid)
+                forwarded = True
+        except Exception:
+            forwarded = False
+        added = 0
+        try:
+            added = await rb.seed_channel_with_contacts(
+                client, guid, target=member_target,
+                batch=config.CHANNEL_ADD_BATCH, delay=config.CHANNEL_ADD_DELAY)
+        except Exception:
+            added = 0
+        return guid, username, forwarded, added
+    return await account_conn.call(acc["phone"], _do, timeout=900)
+
+
+async def run_broadcaster(owner_id: int):
+    b = db.get_broadcaster()
+    title = b.get("title")
+    member_target = int(b.get("member_target") or config.CHANNEL_MEMBER_TARGET)
+    gap = int(b.get("gap_seconds") or config.BROADCAST_GAP_SECONDS)
+    marker = db.get_marker()
+    ids = db.list_broadcaster_account_ids()
+    accounts = [db.get_account(i) for i in ids]
+    accounts = [a for a in accounts if a]
+
+    await log(card("📢 پخش کانالی — شروع", [
+        f"🎛 اسم مشترک : {title}",
+        f"👥 اکانت‌ها : {len(accounts)}",
+        f"🎯 سقف هر کانال : {member_target}",
+        f"⏱ فاصله : {gap}s",
+        f"🕒 {now()}"]))
+
+    made = 0
+    total_added = 0
+    # SEQUENTIAL — never parallel (safe for worker accounts too)
+    for acc in accounts:
+        phone = acc["phone"]
+        try:
+            guid, username, forwarded, added = await _broadcast_one(
+                acc, title, member_target, marker)
+            made += 1
             total_added += added
-            await log(card("🏭 موتور مولد — عضوگیری", [
-                f"👤 {acc['phone']}",
-                f"➕ اضافه‌شده : {added}",
+            await log(card("📢 پخش کانالی — کانال ساخته شد ✅", [
+                f"👤 {phone}",
+                f"🆔 {guid}",
+                (f"🔗 @{username}" if username else "⚠️ یوزرنیم ست نشد"),
+                ("📎 پیام مارکر فرستاده شد" if forwarded
+                 else f"⚠️ مارکر «{marker}» پیدا/فرستاده نشد"),
+                f"➕ مخاطبینِ اضافه‌شده : {added}",
                 f"🕒 {now()}"]))
         except account_conn.InvalidAuthError:
-            await _log_invalid_auth(acc["phone"])
+            await _log_invalid_auth(phone)
         except Exception as e:  # noqa: BLE001
-            await log(card("🏭 موتور مولد — عضوگیری ناموفق", [
-                f"👤 {acc['phone']}", f"💥 {repr(e)[:140]}", f"🕒 {now()}"]))
-        await asyncio.sleep(config.GENERATOR_JOIN_DELAY)
+            await log(card("📢 پخش کانالی — خطا", [
+                f"👤 {phone}", f"💥 {repr(e)[:160]}", f"🕒 {now()}"]))
+        await asyncio.sleep(gap)
 
-    # ---- final report ----
-    await log(card("🏭 موتور مولد — پایان ✅", [
-        f"🎛 {kind_fa} : {title}",
-        f"🆔 {object_guid}",
-        f"👥 اکانتِ عضو : {len(joined)}",
-        f"🛡 ادمین‌شده : {len(admin_ok)}",
-        f"➕ کلِ ممبرِ اضافه‌شده : {total_added}",
+    await log(card("📢 پخش کانالی — پایان ✅", [
+        f"🎛 اسم : {title}",
+        f"✅ کانال‌های ساخته‌شده : {made}/{len(accounts)}",
+        f"➕ کلِ مخاطبینِ اضافه‌شده : {total_added}",
         f"🕒 {now()}"]))
     try:
         await bot.send_message(owner_id,
-                               f"🏭 موتور مولد تمام شد.\n{kind_fa}: {title}\n"
-                               f"عضو: {len(joined)} | ادمین: {len(admin_ok)} | "
-                               f"ممبر اضافه‌شده: {total_added}",
+                               f"📢 پخش کانالی تمام شد.\nکانال: {made}/{len(accounts)} | "
+                               f"مخاطب اضافه‌شده: {total_added}",
                                buttons=main_menu(owner_id == config.OWNER_ID))
     except Exception:
         pass
+
+
+# --------------------------------------------------------------------------- #
+# 🖼 PV image -> PDF export: download EVERY photo from an account's private
+# (user) chats and send them back as a single PDF. Local or worker. No photo
+# is skipped (only photos — videos/gifs/files are ignored, as requested).
+# --------------------------------------------------------------------------- #
+@bot.on(events.CallbackQuery(data=b"pvexport"))
+async def pvexport_menu_cb(event):
+    if not is_owner(event):
+        return
+    accounts = db.list_accounts()
+    if not accounts:
+        await event.answer("اول یک اکانت اضافه کن.", alert=True)
+        return
+    rows = [[Button.inline(f"🖼 {a['phone']}", f"pvx_{a['id']}".encode())]
+            for a in accounts]
+    rows.append([Button.inline("🔙 بازگشت", b"home")])
+    await safe_edit(event,
+        "🖼 از کدوم اکانت عکس‌های پیوی‌ها رو جمع کنم و PDF بفرستم؟\n"
+        "(فقط عکس — فیلم/گیف نه. هیچ عکسی جا نمی‌مونه.)", buttons=rows)
+
+
+@bot.on(events.CallbackQuery(pattern=b"pvx_(\\d+)"))
+async def pvexport_run_cb(event):
+    if not is_owner(event):
+        return
+    aid = int(event.pattern_match.group(1))
+    acc = db.get_account(aid)
+    if not acc:
+        await event.answer("اکانت پیدا نشد.", alert=True)
+        return
+    await safe_edit(event,
+        f"⏳ شروع جمع‌آوری عکس‌های پیویِ {acc['phone']} ... این ممکنه چند دقیقه طول بکشه. "
+        "وقتی آماده شد، PDF برات ارسال می‌شه.",
+        buttons=[[Button.inline("🏠 منوی اصلی", b"home")]])
+    asyncio.create_task(run_pv_export(event.sender_id, acc))
+
+
+async def _pv_collect_photos(acc) -> list:
+    """Return a list of raw image byte-blobs from the account's PV chats.
+    Local: download directly. Worker: ask worker, decode base64."""
+    w = worker.worker_for_account(acc)
+    if w and not worker.is_local(w):
+        import base64
+        res = await worker.api_call(w, "POST", "/pvexport/run", {
+            "phone": acc["phone"], "max_chats": config.PV_EXPORT_MAX_CHATS,
+            "max_photos": config.PV_EXPORT_MAX_PHOTOS}, timeout=1800)
+        if not res.get("ok"):
+            raise RuntimeError(res.get("error", "pvexport failed"))
+        return [base64.b64decode(x) for x in (res.get("photos_b64") or [])]
+
+    async def _do(client):
+        out = []
+        guids = await rb.get_chat_list_guids(client, only_users=True)
+        for g in guids[:config.PV_EXPORT_MAX_CHATS]:
+            async for _mid, fi in rb.iter_chat_photos(client, g):
+                try:
+                    blob = await rb.download_photo(client, fi)
+                    if blob:
+                        out.append(blob)
+                except Exception:
+                    continue
+                if len(out) >= config.PV_EXPORT_MAX_PHOTOS:
+                    return out
+        return out
+    return await account_conn.call(acc["phone"], _do, timeout=1800)
+
+
+async def run_pv_export(owner_id: int, acc):
+    phone = acc["phone"]
+    try:
+        photos = await _pv_collect_photos(acc)
+    except account_conn.InvalidAuthError:
+        await _log_invalid_auth(phone)
+        return
+    except Exception as e:  # noqa: BLE001
+        await log(card("🖼 آرشیو عکس پیوی — خطا", [
+            f"👤 {phone}", f"💥 {repr(e)[:160]}", f"🕒 {now()}"]))
+        try:
+            await bot.send_message(owner_id, f"❌ جمع‌آوری عکس‌های {phone} ناموفق: {repr(e)[:120]}")
+        except Exception:
+            pass
+        return
+
+    if not photos:
+        await bot.send_message(owner_id, f"ℹ️ هیچ عکسی در پیوی‌های {phone} پیدا نشد.",
+                               buttons=main_menu(owner_id == config.OWNER_ID))
+        return
+
+    import pdf_export
+    out_path = os.path.join(DATA_DIR, f"pv_{phone}_{int(datetime.now().timestamp())}.pdf")
+    try:
+        n = await asyncio.to_thread(pdf_export.build_pdf, photos, out_path)
+    except Exception as e:  # noqa: BLE001
+        await bot.send_message(owner_id, f"❌ ساخت PDF ناموفق: {repr(e)[:120]}")
+        return
+
+    await log(card("🖼 آرشیو عکس پیوی ✅", [
+        f"👤 {phone}",
+        f"🖼 تعداد عکس : {n}",
+        f"🕒 {now()}"]))
+    try:
+        await bot.send_file(owner_id, out_path,
+                            caption=f"🖼 آرشیو عکس‌های پیویِ {phone}\nتعداد: {n} عکس",
+                            force_document=True)
+        await bot.send_message(owner_id, "✅ آرشیو ارسال شد.",
+                               buttons=main_menu(owner_id == config.OWNER_ID))
+    finally:
+        try:
+            os.remove(out_path)
+        except Exception:
+            pass
 
 
 # --------------------------------------------------------------------------- #

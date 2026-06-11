@@ -1226,3 +1226,112 @@ async def join_channel_by_username(client: Client, username: str) -> str:
     guid = await resolve_username_to_guid(client, username)
     await join_channel_by_guid(client, guid)
     return guid
+
+
+
+# =========================================================================== #
+# ADDITIVE helpers for: (1) "channel broadcast" engine (each account makes its
+# OWN channel, forwards the marked post, seeds its own contacts), and (2) the
+# PV image -> PDF export. All verified-method-based, no existing func changed.
+# =========================================================================== #
+
+# ---- channel broadcast: set title is via add_channel; seed via existing
+#      seed_channel_with_contacts; forward via existing forward_message ----
+
+async def get_chat_list_guids(client: Client, only_users: bool = True) -> list:
+    """Return guids of chats. If only_users, just private (user) chats — used by
+    the PV image export. Paginated."""
+    out = []
+    seen = set()
+    start_id = None
+    for _ in range(200):
+        result = await client.get_chats(start_id) if start_id else await client.get_chats()
+        chats = getattr(result, "chats", None)
+        if chats is None and isinstance(result, dict):
+            chats = result.get("chats", [])
+        for ch in chats or []:
+            g = _guid_of(ch)
+            if not g or g in seen:
+                continue
+            if only_users and _type_of(ch) != "user":
+                continue
+            seen.add(g)
+            out.append(g)
+        start_id = _next_start_id(result)
+        if not start_id or not chats:
+            break
+    return out
+
+
+def _msg_is_photo(msg) -> bool:
+    """True if a message carries a PHOTO (not video/gif/file)."""
+    d = _data_of(msg)
+    # file_inline holds media metadata in rubpy
+    fi = d.get("file_inline") or {}
+    if isinstance(fi, dict):
+        t = (fi.get("type") or "").lower()
+        if t:
+            return t == "image"          # 'Image' for photos; 'Video'/'Gif'/'File' otherwise
+        mime = (fi.get("mime") or "").lower()
+        if mime:
+            return mime in ("jpg", "jpeg", "png", "webp", "bmp")
+    return False
+
+
+def _file_inline_of(msg):
+    d = _data_of(msg)
+    fi = d.get("file_inline")
+    return fi if isinstance(fi, dict) else None
+
+
+async def iter_chat_photos(client: Client, object_guid: str, max_pages: int = 200):
+    """Yield (message_id, file_inline) for every PHOTO message in a chat,
+    walking the whole history page by page (oldest pagination via max_id)."""
+    max_id = None
+    for _ in range(max_pages):
+        try:
+            if max_id:
+                result = await client.get_messages(object_guid, max_id, "50")
+            else:
+                result = await client.get_messages(object_guid, "0", "50")
+        except Exception:
+            break
+        messages = getattr(result, "messages", None)
+        if messages is None and isinstance(result, dict):
+            messages = result.get("messages", [])
+        if not messages:
+            break
+        for m in messages:
+            if _msg_is_photo(m):
+                fi = _file_inline_of(m)
+                if fi:
+                    yield _msg_id_of(m), fi
+        last = messages[-1]
+        nxt = _msg_id_of(last)
+        if not nxt or nxt == max_id:
+            break
+        max_id = nxt
+
+
+async def download_photo(client: Client, file_inline) -> bytes:
+    """Download a photo's bytes from its file_inline. Tolerant of rubpy diffs."""
+    fn = getattr(client, "download", None)
+    if fn is None:
+        raise RuntimeError("this rubpy build has no download()")
+    # rubpy's download usually accepts the file_inline dict/object directly
+    res = await _try_call(fn, [
+        lambda: ((file_inline,), {}),
+        lambda: ((), {"file_inline": file_inline}),
+    ])
+    if isinstance(res, (bytes, bytearray)):
+        return bytes(res)
+    # some builds return an object with .data / bytes
+    for attr in ("data", "content", "bytes"):
+        v = getattr(res, attr, None)
+        if isinstance(v, (bytes, bytearray)):
+            return bytes(v)
+    if isinstance(res, dict):
+        for k in ("data", "content", "bytes"):
+            if isinstance(res.get(k), (bytes, bytearray)):
+                return bytes(res[k])
+    raise RuntimeError("download() returned no bytes")

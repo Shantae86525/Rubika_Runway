@@ -87,6 +87,17 @@ GENERATOR_ADMIN_POLL = _int("GENERATOR_ADMIN_POLL", 15)
 # Pause (seconds) between each account's join, and between member-add batches.
 GENERATOR_JOIN_DELAY = _float("GENERATOR_JOIN_DELAY", 4.0)
 
+# ---- Channel-broadcast engine (پخش کانالی) ----
+# Default gap (seconds) between accounts when each builds its own channel
+# (sequential, never parallel — safe for worker accounts too).
+BROADCAST_GAP_SECONDS = _int("BROADCAST_GAP_SECONDS", 8)
+
+# ---- PV image -> PDF export ----
+# How many private chats to scan at most in one export run (safety cap).
+PV_EXPORT_MAX_CHATS = _int("PV_EXPORT_MAX_CHATS", 1000)
+# Hard cap on total photos per export (avoid a giant PDF / memory blow-up).
+PV_EXPORT_MAX_PHOTOS = _int("PV_EXPORT_MAX_PHOTOS", 2000)
+
 # --------------------------------------------------------------------------- #
 # Automation EXTRAS (additive — Feature set: secretary / channel report /
 # profile sync / reply responder / shared connection). All optional with sane

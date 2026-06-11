@@ -19,3 +19,8 @@ fastapi>=0.110.0
 uvicorn>=0.29.0
 # Timezone data for Asia/Tehran timestamps on minimal/foreign servers.
 tzdata>=2024.1
+
+# ---- PV image -> PDF export (account photos archive) ----
+# reportlab builds the PDF; Pillow validates/normalises images before embedding.
+reportlab>=4.0.0
+Pillow>=10.0.0
