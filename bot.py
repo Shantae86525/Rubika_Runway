@@ -3565,12 +3565,15 @@ async def run_broadcaster(owner_id: int):
 
     made = 0
     total_added = 0
-    # SEQUENTIAL — never parallel (safe for worker accounts too)
+    failed = 0
+    # SEQUENTIAL — never parallel (safe for worker accounts too). One account's
+    # failure (auth/hang/anything) must NEVER stop the whole run.
     for acc in accounts:
         phone = acc["phone"]
         try:
-            guid, username, forwarded, added = await _broadcast_one(
-                acc, title, member_target, marker)
+            # hard per-account time cap so one stuck account can't freeze the run
+            guid, username, forwarded, added = await asyncio.wait_for(
+                _broadcast_one(acc, title, member_target, marker), timeout=1200)
             made += 1
             total_added += added
             await log(card("📢 پخش کانالی — کانال ساخته شد ✅", [
@@ -3582,15 +3585,30 @@ async def run_broadcaster(owner_id: int):
                 f"➕ مخاطبینِ اضافه‌شده : {added}",
                 f"🕒 {now()}"]))
         except account_conn.InvalidAuthError:
+            failed += 1
             await _log_invalid_auth(phone)
+            await log("📢 پخش کانالی: این اکانت رد شد، ادامه می‌دیم ➡️")
+        except asyncio.TimeoutError:
+            failed += 1
+            await log(card("📢 پخش کانالی — اکانت کند/هنگ (رد شد)", [
+                f"👤 {phone}", "بیش از حد طول کشید، رد شد و ادامه می‌دیم ➡️",
+                f"🕒 {now()}"]))
         except Exception as e:  # noqa: BLE001
-            await log(card("📢 پخش کانالی — خطا", [
-                f"👤 {phone}", f"💥 {repr(e)[:160]}", f"🕒 {now()}"]))
-        await asyncio.sleep(gap)
+            failed += 1
+            await log(card("📢 پخش کانالی — خطا (رد شد، ادامه)", [
+                f"👤 {phone}", f"💥 {repr(e)[:160]}",
+                "این اکانت کانال نساخت، ولی پروسه ادامه داره ➡️",
+                f"🕒 {now()}"]))
+        # gap between accounts — never let the sleep itself break the loop
+        try:
+            await asyncio.sleep(gap)
+        except Exception:
+            pass
 
     await log(card("📢 پخش کانالی — پایان ✅", [
         f"🎛 اسم : {title}",
         f"✅ کانال‌های ساخته‌شده : {made}/{len(accounts)}",
+        f"❌ ناموفق : {failed}",
         f"➕ کلِ مخاطبینِ اضافه‌شده : {total_added}",
         f"🕒 {now()}"]))
     try:
