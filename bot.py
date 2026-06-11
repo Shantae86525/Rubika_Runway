@@ -3375,37 +3375,43 @@ async def _gen_self_guid(acc):
 
 
 async def _gen_create(acc, kind, title):
+    """Create a CHANNEL, give it a random public username (so others can join
+    by username — private invite links don't work reliably for joining), and
+    return (channel_guid, username, creator_guid). `kind` is kept for signature
+    compatibility but the generator is channel-only."""
     w = worker.worker_for_account(acc)
     if w and not worker.is_local(w):
         res = await worker.api_call(w, "POST", "/gen/create",
-                                    {"phone": acc["phone"], "kind": kind,
+                                    {"phone": acc["phone"], "kind": "channel",
                                      "title": title}, timeout=120)
-        return res.get("object_guid"), res.get("link", ""), res.get("creator_guid")
+        return res.get("object_guid"), res.get("username", ""), res.get("creator_guid")
 
     async def _do(client):
-        guid = await rb.create_object(client, kind, title)
-        link = ""
+        guid = await rb.create_channel(client, title)
+        username = ""
         try:
-            link = await rb.make_join_link(client, guid)
+            username = await rb.assign_random_channel_username(client, guid)
         except Exception:
-            link = ""
+            username = ""
         self_guid = await rb.get_self_guid(client)
-        return guid, link, self_guid
+        return guid, username, self_guid
     return await account_conn.call(acc["phone"], _do, timeout=120)
 
 
-async def _gen_join(acc, link):
+async def _gen_join(acc, username):
+    """Join the channel by its public username (verified working method)."""
     w = worker.worker_for_account(acc)
     if w and not worker.is_local(w):
         res = await worker.api_call(w, "POST", "/gen/join",
-                                    {"phone": acc["phone"], "link": link}, timeout=90)
+                                    {"phone": acc["phone"], "username": username},
+                                    timeout=90)
         if not res.get("ok"):
             raise RuntimeError(res.get("error", "join failed"))
         return res.get("guid")
 
     async def _do(client):
-        await rb.join_group_by_link(client, link)
-        return await rb.get_self_guid(client)
+        guid = await rb.join_channel_by_username(client, username)
+        return guid
     return await account_conn.call(acc["phone"], _do, timeout=90)
 
 
@@ -3444,22 +3450,20 @@ async def _gen_seed(acc, kind, object_guid, target, exclude):
 def generator_menu_text():
     g = db.get_generator()
     creator = db.get_account(g["creator_id"]) if g.get("creator_id") else None
-    return card("🏭 موتور مولد", [
-        f"نوع : {'گروه' if g.get('kind') == 'group' else 'کانال'}",
-        f"اسم : {g.get('title') or '—'}",
+    return card("🏭 موتور مولد (کانال)", [
+        f"اسم کانال : {g.get('title') or '—'}",
         f"سازنده : {creator['phone'] if creator else '—'}",
         f"سقف عضوگیری (هر اکانت) : {g.get('member_target')}",
         f"مهلت انتظار ادمین : {g.get('admin_wait')} ثانیه",
         LINE,
-        "ربات می‌سازه → بقیه عضو می‌شن → تو دستی ادمینشون کن → "
-        "ربات چک می‌کنه → بعد عضوگیری مخاطبین.",
+        "ربات کانال می‌سازه + یوزرنیم رندوم → بقیه اکانت‌ها با یوزرنیم عضو می‌شن "
+        "→ تو دستی ادمینشون کن → ربات چک می‌کنه → بعد عضوگیری مخاطبین.",
     ])
 
 
 def generator_menu_buttons():
     return [
-        [Button.inline("🔀 نوع (کانال/گروه)", b"gen_kind"),
-         Button.inline("✏️ اسم", b"gen_title")],
+        [Button.inline("✏️ اسم کانال", b"gen_title")],
         [Button.inline("👤 اکانت سازنده", b"gen_creator"),
          Button.inline("🎯 سقف عضوگیری", b"gen_target")],
         [Button.inline("⏱ مهلت انتظار ادمین", b"gen_wait")],
@@ -3592,12 +3596,12 @@ async def gen_start_cb(event):
 
 async def run_generator(owner_id: int):
     g = db.get_generator()
-    kind = g.get("kind") or "channel"
     title = g.get("title")
     creator = db.get_account(g["creator_id"])
     member_target = int(g.get("member_target") or config.CHANNEL_MEMBER_TARGET)
     admin_wait = int(g.get("admin_wait") or 600)
-    kind_fa = "گروه" if kind == "group" else "کانال"
+    kind = "channel"            # generator is channel-only (groups can't be auto-joined)
+    kind_fa = "کانال"
 
     if not creator:
         await log("🏭 موتور مولد: اکانتِ سازنده پیدا نشد.")
@@ -3605,9 +3609,9 @@ async def run_generator(owner_id: int):
 
     others = [a for a in db.list_accounts() if a["id"] != creator["id"]]
 
-    # ---- phase 1: create ----
+    # ---- phase 1: create channel + random public username ----
     try:
-        object_guid, link, creator_guid = await _gen_create(creator, kind, title)
+        object_guid, username, creator_guid = await _gen_create(creator, kind, title)
     except account_conn.InvalidAuthError:
         await _log_invalid_auth(creator["phone"])
         return
@@ -3615,19 +3619,26 @@ async def run_generator(owner_id: int):
         await log(card("🏭 موتور مولد — خطا در ساخت", [
             f"👤 سازنده : {creator['phone']}", f"💥 {repr(e)[:160]}", f"🕒 {now()}"]))
         return
-    await log(card(f"🏭 موتور مولد — {kind_fa} ساخته شد ✅", [
-        f"🎛 {kind_fa} : {title}",
+    if not username:
+        await log(card("🏭 موتور مولد — یوزرنیم ست نشد", [
+            f"🎛 کانال : {title}", f"🆔 {object_guid}",
+            "بدون یوزرنیمِ عمومی، بقیه اکانت‌ها نمی‌تونن خودکار عضو شن.",
+            "خودت دستی یه یوزرنیم برای کانال بذار و اکانت‌ها رو عضو/ادمین کن.",
+            f"🕒 {now()}"]))
+    await log(card("🏭 موتور مولد — کانال ساخته شد ✅", [
+        f"🎛 کانال : {title}",
         f"🆔 {object_guid}",
         f"👤 سازنده : {creator['phone']}",
-        (f"🔗 لینک : {link}" if link else "⚠️ لینک دعوت گرفته نشد"),
+        (f"🔗 یوزرنیم : @{username}\nhttps://rubika.ir/{username}"
+         if username else "⚠️ یوزرنیم ست نشد"),
         f"🕒 {now()}"]))
 
-    # ---- phase 2: others join (sequential) ----
+    # ---- phase 2: others join BY USERNAME (sequential) ----
     joined = []           # list of (acc, guid)
-    if link:
+    if username:
         for acc in others:
             try:
-                guid = await _gen_join(acc, link)
+                guid = await _gen_join(acc, username)
                 joined.append((acc, guid))
                 await log(card("🏭 موتور مولد — عضو شد", [
                     f"👤 {acc['phone']}", f"🆔 {guid}", f"🕒 {now()}"]))
@@ -3638,13 +3649,13 @@ async def run_generator(owner_id: int):
                     f"👤 {acc['phone']}", f"💥 {repr(e)[:140]}", f"🕒 {now()}"]))
             await asyncio.sleep(config.GENERATOR_JOIN_DELAY)
     else:
-        await log("🏭 موتور مولد: چون لینک دعوت نداریم، بقیه اکانت‌ها خودکار عضو نشدن. "
+        await log("🏭 موتور مولد: چون یوزرنیم نداریم، بقیه اکانت‌ها خودکار عضو نشدن. "
                   "خودت دستی عضو و ادمینشون کن، بعد عضوگیری انجام می‌شه.")
 
     # ---- phase 3: wait for the owner to make joined accounts admin ----
     await log(card("🏭 موتور مولد — منتظر ادمین‌شدن ⏳", [
         f"تعداد اکانتِ عضو : {len(joined)}",
-        "حالا خودت این اکانت‌ها رو دستی ادمینِ کانال/گروه کن.",
+        "حالا خودت این اکانت‌ها رو دستی ادمینِ کانال کن.",
         f"مهلت : {admin_wait} ثانیه",
         f"🕒 {now()}"]))
 

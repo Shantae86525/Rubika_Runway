@@ -1121,3 +1121,108 @@ async def seed_object_with_contacts(client: Client, kind: str, object_guid: str,
         if i + batch < len(guids):
             await asyncio.sleep(delay)
     return added
+
+
+
+# --------------------------------------------------------------------------- #
+# Generator (channel-only) helpers — VERIFIED against rubpy 7.3.5:
+#   check_channel_username(username) -> {"exist": bool}
+#   update_channel_username(channel_guid, username)
+#   get_object_by_username(username) -> {channel:{channel_guid}}
+#   join_channel_action(channel_guid, 'Join')
+# Used to make a fresh channel public with a RANDOM username so the other
+# accounts can join it by that username (private invite links don't work for
+# joining reliably, per the project owner's testing).
+# --------------------------------------------------------------------------- #
+import random as _random
+import string as _string
+
+
+def random_username(prefix: str = "ch", length: int = 18) -> str:
+    """A random public username, e.g. 'ch6bsmf11lxmz91yin76' (letters+digits)."""
+    body = "".join(_random.choices(_string.ascii_lowercase + _string.digits,
+                                   k=max(5, length)))
+    return f"{prefix}{body}"[:32]
+
+
+async def channel_username_free(client: Client, username: str) -> bool:
+    """True if the channel username is available. check returns {'exist': False}
+    when it's FREE."""
+    fn = getattr(client, "check_channel_username", None)
+    if fn is None:
+        return True
+    try:
+        res = await _try_call(fn, [
+            lambda: ((username,), {}),
+            lambda: ((), {"username": username}),
+        ])
+        d = _data_of(res)
+        if "exist" in d:
+            return not bool(d.get("exist"))
+    except Exception:
+        pass
+    return True
+
+
+async def set_channel_username(client: Client, channel_guid: str, username: str):
+    """Set a public username on a channel."""
+    fn = getattr(client, "update_channel_username", None)
+    if fn is None:
+        raise RuntimeError("this rubpy build has no update_channel_username()")
+    return await _try_call(fn, [
+        lambda: ((channel_guid, username), {}),
+        lambda: ((), {"channel_guid": channel_guid, "username": username}),
+    ])
+
+
+async def assign_random_channel_username(client: Client, channel_guid: str,
+                                         tries: int = 6) -> str:
+    """Pick a free random username and set it on the channel. Returns the
+    username that was set (or raises if none worked)."""
+    last_err = None
+    for _ in range(max(1, tries)):
+        u = random_username()
+        try:
+            if await channel_username_free(client, u):
+                await set_channel_username(client, channel_guid, u)
+                return u
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            continue
+    raise RuntimeError(f"could not assign a username: {last_err}")
+
+
+async def resolve_username_to_guid(client: Client, username: str) -> str:
+    """Turn a public username into a channel guid via get_object_by_username."""
+    fn = getattr(client, "get_object_by_username", None)
+    if fn is None:
+        raise RuntimeError("this rubpy build has no get_object_by_username()")
+    res = await _try_call(fn, [
+        lambda: ((username,), {}),
+        lambda: ((), {"username": username}),
+    ])
+    d = _data_of(res)
+    ch = d.get("channel") if isinstance(d.get("channel"), dict) else {}
+    guid = (ch.get("channel_guid") if isinstance(ch, dict) else None) \
+        or _channel_guid_of(res) or _guid_of(res)
+    if not guid:
+        raise RuntimeError("could not resolve username to a channel guid")
+    return guid
+
+
+async def join_channel_by_guid(client: Client, channel_guid: str):
+    """Join a channel by its guid (the verified working way). Tolerant of diffs."""
+    fn = getattr(client, "join_channel_action", None)
+    if fn is None:
+        raise RuntimeError("this rubpy build has no join_channel_action()")
+    return await _try_call(fn, [
+        lambda: ((channel_guid, "Join"), {}),
+        lambda: ((), {"channel_guid": channel_guid, "action": "Join"}),
+    ])
+
+
+async def join_channel_by_username(client: Client, username: str) -> str:
+    """Resolve a username to a guid then join it. Returns the channel guid."""
+    guid = await resolve_username_to_guid(client, username)
+    await join_channel_by_guid(client, guid)
+    return guid

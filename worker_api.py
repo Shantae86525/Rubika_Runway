@@ -163,7 +163,7 @@ def _build_app():
 
     class GenJoinIn(BaseModel):
         phone: str
-        link: str
+        username: str
 
     class GenAdminIn(BaseModel):
         phone: str
@@ -562,14 +562,15 @@ def _build_app():
     async def gen_create(body: GenCreateIn, authorization: str = Header(None)):
         _auth(authorization)
         async def _do(client):
-            guid = await rb.create_object(client, body.kind, body.title)
-            link = ""
+            guid = await rb.create_channel(client, body.title)
+            username = ""
             try:
-                link = await rb.make_join_link(client, guid)
+                username = await rb.assign_random_channel_username(client, guid)
             except Exception:
-                link = ""
+                username = ""
             self_guid = await rb.get_self_guid(client)
-            return {"object_guid": guid, "link": link, "creator_guid": self_guid}
+            return {"object_guid": guid, "username": username,
+                    "creator_guid": self_guid}
         res = await account_conn.call(body.phone, _do, timeout=120)
         return {"ok": True, **res}
 
@@ -577,8 +578,7 @@ def _build_app():
     async def gen_join(body: GenJoinIn, authorization: str = Header(None)):
         _auth(authorization)
         async def _do(client):
-            await rb.join_group_by_link(client, body.link)
-            return await rb.get_self_guid(client)
+            return await rb.join_channel_by_username(client, body.username)
         try:
             guid = await account_conn.call(body.phone, _do, timeout=90)
             return {"ok": True, "guid": guid}
